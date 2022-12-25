@@ -300,6 +300,19 @@ class glue_evaluator:
                 if not trainable_components[0] in name:
                     param.requires_grad = False
 
+        if ft_type == 'bitfit_ln':
+            for param in self.model.parameters():
+                param.requires_grad = False
+            trainable_components = trainable_components + ['classifier', 'pooler.dense.bias', 'LayerNorm']
+            for name, param in self.model.named_parameters():
+                for component in trainable_components:
+                    if component in name:
+                        param.requires_grad = True
+                        break
+
+        else:
+            raise Exception('fine tuning type must in bitfit, outlier, layernorm, bitfit_ln')
+
 
     @staticmethod
     def convert_to_actual_components(components):

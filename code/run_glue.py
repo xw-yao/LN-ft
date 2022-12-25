@@ -23,7 +23,7 @@ def _parse_args():
                         choices={'bert-base-cased', 'bert-large-cased', 'roberta-base'})
     parser.add_argument('--fine-tune-type', '-f', required=True, type=str,
                         help='Which fine tuning process to perform, types are the types that were performed in BitFit paper.',
-                        choices={'full_ft', 'bitfit', 'outlier', 'layernorm'})
+                        choices={'full_ft', 'bitfit', 'outlier', 'layernorm', 'bitfit_ln'})
     parser.add_argument('--param-terms', metavar='N', type=str, nargs='+', default=['all'],
                         choices={'intermediate', 'key', 'query', 'value', 'output', 'layernorm', 'output_layernorm',
                                  'attention_layernorm', 'all'},
@@ -105,6 +105,13 @@ def _perform_training_preparations(evaluator, args, trainable_components):
         evaluator.training_preparation(learning_rate=args.learning_rate,
                                        encoder_trainable=False,
                                        ft_type='layernorm',
+                                       trainable_components=trainable_components,
+                                       verbose=args.verbose)
+
+    if args.fine_tune_type == 'bitfit_ln':
+        evaluator.training_preparation(learning_rate=args.learning_rate,
+                                       encoder_trainable=False,
+                                       ft_type='bitfit_ln',
                                        trainable_components=trainable_components,
                                        verbose=args.verbose)
 
