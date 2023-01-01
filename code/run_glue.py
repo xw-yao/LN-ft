@@ -23,10 +23,10 @@ def _parse_args():
                         choices={'bert-base-cased', 'bert-large-cased', 'roberta-base'})
     parser.add_argument('--fine-tune-type', '-f', required=True, type=str,
                         help='Which fine tuning process to perform, types are the types that were performed in BitFit paper.',
-                        choices={'full_ft', 'bitfit', 'outlier', 'layernorm', 'bitfit_ln'})
+                        choices={'full_ft', 'bitfit', 'outlier', 'layernorm', 'bitfit_ln', 'lora', 'lora_ln'})
     parser.add_argument('--param-terms', metavar='N', type=str, nargs='+', default=['all'],
                         choices={'intermediate', 'key', 'query', 'value', 'output', 'layernorm', 'output_layernorm',
-                                 'attention_layernorm', 'all'},
+                                 'attention_layernorm', 'lora', 'all'},
                         help='bias terms to BitFit, should be given in case --fine-tune-type is bitfit '
                              '(choose \'all\' for BitFit all bias terms)')
     parser.add_argument('--gpu-device', '-d', type=int, default=None,
@@ -35,6 +35,10 @@ def _parse_args():
     parser.add_argument('--learning-rate', '-l', type=float, default=1e-3, help='learning rate for training.')
     parser.add_argument('--epochs', '-e', type=int, default=15, help='number of training epochs.')
     parser.add_argument('--batch-size', '-b', type=int, default=8, help='training and evaluation batch size.')
+    parser.add_argument('--apply-lora', action='store_true', default=False,
+                        help='Whether to apply LoRA or not.')
+    parser.add_argument('--lora_alpha', '-la', type=int, default=16, help='LoRA alpha')
+    parser.add_argument('--lora_r', '-lr', type=int, default=8, help='LoRa r')
     parser.add_argument('--save-evaluator', action='store_true', default=False,
                         help='if given, will save the evaluator for later inference/examination.')
     parser.add_argument('--verbose', action='store_true', default=True,
@@ -114,6 +118,27 @@ def _perform_training_preparations(evaluator, args, trainable_components):
                                        ft_type='bitfit_ln',
                                        trainable_components=trainable_components,
                                        verbose=args.verbose)
+
+    if args.fine_tune_type == 'lora_ln':
+        evaluator.training_preparation(learning_rate=args.learning_rate,
+                                       encoder_trainable=False,
+                                       ft_type='lora_ln',
+                                       trainable_components=trainable_components,
+                                       apply_lora=args.apply_lora,
+                                       lora_alpha=args.lora_alpha,
+                                       lora_r=args.lora_r,
+                                       verbose=args.verbose)
+
+    if args.fine_tune_type == 'lora':
+        evaluator.training_preparation(learning_rate=args.learning_rate,
+                                       encoder_trainable=False,
+                                       ft_type='lora',
+                                       trainable_components=trainable_components,
+                                       apply_lora=args.apply_lora,
+                                       lora_alpha=args.lora_alpha,
+                                       lora_r=args.lora_r,
+                                       verbose=args.verbose)
+
 
 def main():
     # args parsing

@@ -165,8 +165,13 @@ class glue_evaluator:
 
         self.encoder_trainable = encoder_trainable
         # model declaration
-        config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, return_dict=True)
+        if apply_lora:
+            config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, apply_lora=True, lora_alpha=lora_alpha, lora_r=lora_r, return_dict=True)
+        else:
+            config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, return_dict=True)
+
         self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name, config=config)
+
         if not encoder_trainable:
             self._deactivate_relevant_gradients(ft_type, trainable_components)
 
@@ -310,8 +315,21 @@ class glue_evaluator:
                         param.requires_grad = True
                         break
 
-        else:
-            raise Exception('fine tuning type must in bitfit, outlier, layernorm, bitfit_ln')
+        if ft_type == 'lora_ln':
+            for param in self.model.parameters():
+                param.requires_grad = False
+            if trainable_components:
+                trainable_components = trainable_components + ['LayerNorm']
+            for name, param in self.model.named_parameters():
+                for component in trainable_components:
+                    if component in name:
+                        param.requires_grad = True
+                        break
+
+        if ft_type == 'lora':
+            for name, param in self.model.named_parameters():
+                if not trainable_components[0] in name:
+                    param.requires_grad = False
 
 
     @staticmethod
