@@ -17,4 +17,4 @@ python run_glue.py
        --learning-rate 1e-5
        --save-evaluator
 
-To run outlier fine-tuning and layernorm fine-tuning, set arg --bias-terms to 'layer norm'.
+To run 'outlier', 'layernorm', and 'lora' fine-tuning , set arg --bias-terms to 'layernorm', 'lora' respectively.
