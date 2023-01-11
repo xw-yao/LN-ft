@@ -1,5 +1,4 @@
 from scipy.stats import spearmanr, pearsonr
-from time import time
 from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
 import numpy as np
 import pickle
@@ -8,9 +7,11 @@ import torch
 from torch.optim import Adam
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from datasets import load_dataset
-from transformers.optimization import AdamW
+from transformers.optimization import AdamW, get_linear_schedule_with_warmup
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 from utils import setup_logging
+from datasets.arrow_dataset import Dataset
+import torch.nn as nn
 
 
 setup_logging()
@@ -193,7 +194,7 @@ class glue_evaluator:
         self.evaluations = {k: {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]} for k in
                             self.data_loaders.keys()}
 
-    def train_and_evaluate(self, num_epochs, evaluation_frequency=1):
+    def train_and_evaluate(self, num_epochs, gradient_accumulation_steps, warmup_ratio, ft_type=None, evaluation_frequency=1):
         """Trains the encoder model and evaluate it on validation set.
         Learning curves will be saved to the output_path.
         Args:
@@ -213,13 +214,16 @@ class glue_evaluator:
             self.model.cuda(self.device)
 
         # train and evaluate
-        time_log = []
+        self.epochs = num_epochs
+        n = len(self.data_loaders['train'].dataset)
+        t_total = n // gradient_accumulation_steps * num_epochs
+        warmup_steps = math.ceil(t_total * warmup_ratio)
+        self.scheduler = get_linear_schedule_with_warmup(self.optimizer, num_warmup_steps=warmup_steps,
+                                                         num_training_steps=t_total)
+
         for epoch in range(num_epochs):
-            start_time = time()
             # training for a single epoch
-            self._train(self.data_loaders['train'], epoch)
-            end_time = time()
-            time_log.append((end_time - start_time))
+            self._train(self.data_loaders['train'], epoch, ft_type=ft_type)
 
             # evaluation
             if not epoch % evaluation_frequency:
@@ -229,7 +233,6 @@ class glue_evaluator:
                         for metric_name, result in results.items():
                             self.evaluations[dataloader_type][metric_name].append(result)
             print('')
-        print(time_log)
 
     def save(self, output_path):
         """Saves the evaluator to the output_path directory.
@@ -286,18 +289,7 @@ class glue_evaluator:
                 param.requires_grad = False
 
             for name, param in self.model.named_parameters():
-                if all(x in name for x in [trainable_components[0], 'weight']) and not any(
-                        x in name for x in ['attention', 'embeddings']):
-                    for dim in range(768):
-                        if dim != 308 and dim != 381:
-                            param[dim] = 0
-                    param.requires_grad = True
-
-                if all(x in name for x in [trainable_components[0], 'bias']) and not any(
-                        x in name for x in ['attention', 'embeddings']):
-                    for dim in range(768):
-                        if dim != 308 and dim != 381:
-                            param[dim] = 0
+                if trainable_components[0] in name and not any(x in name for x in ['attention', 'embeddings']):
                     param.requires_grad = True
 
         if ft_type == 'layernorm':
@@ -336,7 +328,7 @@ class glue_evaluator:
     def convert_to_actual_components(components):
         return [BIAS_TERMS_DICT[component] for component in components]
 
-    def _train(self, train_dataloader, epoch, max_grad_norm=1.0):
+    def _train(self, train_dataloader, epoch, ft_type=None, max_grad_norm=1.0):
         """Trains the model for a single epoch
         Args:
             train_dataloader (torch.utils.data.DataLoader): the train data loader
@@ -390,6 +382,21 @@ class glue_evaluator:
 
             # update parameters
             self.optimizer.step()
+
+            if ft_type == 'outlier':
+                for param in self.model.parameters():
+                    param.requires_grad = False
+                idx = 0
+                for name, param in self.model.named_parameters():
+                    if 'LayerNorm' in name and not any(x in name for x in ['attention', 'embeddings']):
+                        for dim in range(768):
+                            if dim != 308 and dim != 381:
+                                param[dim] = self.init_out_ln_params[idx][dim]
+                        idx += 1
+                        param.requires_grad = True
+                self.optimizer.step()
+
+            self.scheduler.step()
             self.model.zero_grad()
 
             # track train loss

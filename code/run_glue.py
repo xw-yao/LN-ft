@@ -34,6 +34,12 @@ def _parse_args():
     parser.add_argument('--seed', '-s', type=int, default=0, help='seed value to set.')
     parser.add_argument('--learning-rate', '-l', type=float, default=1e-3, help='learning rate for training.')
     parser.add_argument('--epochs', '-e', type=int, default=15, help='number of training epochs.')
+    parser.add_argument('--gradient-accumulation-steps', '-g', type=int, default=1,
+                        help='steps of gradient accumulation.')
+    parser.add_argument('--warmup-ratio', '-w', type=float, default=0,
+                        help='learning rate warm-up ratio.')
+    parser.add_argument('--weight-decay', '-wd', type=float, default=0,
+                        help='Weight decay.')
     parser.add_argument('--batch-size', '-b', type=int, default=8, help='training and evaluation batch size.')
     parser.add_argument('--apply-lora', action='store_true', default=False,
                         help='Whether to apply LoRA or not.')
@@ -161,7 +167,7 @@ def main():
     _perform_training_preparations(evaluator, args, trainable_components)
 
     # train and evaluate
-    evaluator.train_and_evaluate(args.epochs)
+    evaluator.train_and_evaluate(args.epochs, args.gradient_accumulation_steps, args.warmup_ratio, ft_type=args.fine_tune_type)
 
     # save model
     if args.save_evaluator:
