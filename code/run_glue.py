@@ -1,3 +1,9 @@
+"""This file contains a tool that wraps the GLUEvaluator API, the tool supports all the evaluations that were
+performed in BitFit paper (https://arxiv.org/abs/1804.07461), such as: 'full_ft', 'bitfit', 'frozen', 'rand_uniform'
+and 'rand_row_col'.
+For questions please reach: benzakenelad@gmail.com
+Author Elad Ben-Zaken
+"""
 import argparse
 import os
 import logging
@@ -20,7 +26,7 @@ def _parse_args():
     parser.add_argument('--task-name', '-t', required=True, type=str, help='GLUE task name for evaluation.',
                         choices={'cola', 'mnli', 'mrpc', 'qnli', 'qqp', 'rte', 'sst2', 'stsb', 'wnli'})
     parser.add_argument('--model-name', '-m', type=str, default='bert-base-cased', help='model-name to evaluate with.',
-                        choices={'bert-base-cased', 'bert-large-cased', 'roberta-base'})
+                        choices={'bert-base-cased', 'bert-large-cased', 'roberta-base', 'opt'})
     parser.add_argument('--fine-tune-type', '-f', required=True, type=str,
                         help='Which fine tuning process to perform, types are the types that were performed in BitFit paper.',
                         choices={'full_ft', 'bitfit', 'outlier', 'layernorm', 'bitfit_ln', 'lora', 'lora_ln'})
@@ -34,22 +40,20 @@ def _parse_args():
     parser.add_argument('--seed', '-s', type=int, default=0, help='seed value to set.')
     parser.add_argument('--learning-rate', '-l', type=float, default=1e-3, help='learning rate for training.')
     parser.add_argument('--epochs', '-e', type=int, default=15, help='number of training epochs.')
-    parser.add_argument('--gradient-accumulation-steps', '-g', type=int, default=1,
-                        help='steps of gradient accumulation.')
+    parser.add_argument('--gradient-accumulation-steps', '-g', type=int, default=1, help='steps of gradient accumulation.')
     parser.add_argument('--warmup-ratio', '-w', type=float, default=0,
                         help='learning rate warm-up ratio.')
     parser.add_argument('--weight-decay', '-wd', type=float, default=0,
                         help='Weight decay.')
     parser.add_argument('--batch-size', '-b', type=int, default=8, help='training and evaluation batch size.')
     parser.add_argument('--apply-lora', action='store_true', default=False,
-                        help='Whether to apply LoRA or not.')
+                        help='if given, will apply LoRA.')
     parser.add_argument('--lora_alpha', '-la', type=int, default=16, help='LoRA alpha')
     parser.add_argument('--lora_r', '-lr', type=int, default=8, help='LoRa r')
     parser.add_argument('--save-evaluator', action='store_true', default=False,
                         help='if given, will save the evaluator for later inference/examination.')
     parser.add_argument('--verbose', action='store_true', default=True,
                         help='if given, will plot a list of trainable weights.')
-
     return parser.parse_args()
 
 
@@ -82,6 +86,9 @@ def _plot_training_details(args):
         LOGGER.info(f'Running on CPU')
 
     LOGGER.info(f'Epochs: {args.epochs}')
+    LOGGER.info(f'Gradient Accumulation Steps: {args.gradient_accumulation_steps}')
+    LOGGER.info(f'Warmup Ratio: {args.warmup_ratio}')
+    LOGGER.info(f'Weight Decay: {args.weight_decay}')
     LOGGER.info(f'Learning Rate: {args.learning_rate}')
     LOGGER.info(f'Batch Size: {args.batch_size}')
     LOGGER.info(f"Optimizer: 'AdamW'")
@@ -95,27 +102,31 @@ def _perform_training_preparations(evaluator, args, trainable_components):
     if args.fine_tune_type == 'full_ft':
         evaluator.training_preparation(learning_rate=args.learning_rate,
                                        encoder_trainable=True,
+                                       weight_decay=args.weight_decay,
                                        verbose=args.verbose)
 
-    if args.fine_tune_type =='bitfit':
+    if args.fine_tune_type == 'bitfit':
         evaluator.training_preparation(learning_rate=args.learning_rate,
                                        encoder_trainable=False,
                                        ft_type='bitfit',
                                        trainable_components=trainable_components,
+                                       weight_decay=args.weight_decay,
                                        verbose=args.verbose)
 
-    if args.fine_tune_type =='outlier':
+    if args.fine_tune_type == 'outlier':
         evaluator.training_preparation(learning_rate=args.learning_rate,
                                        encoder_trainable=False,
                                        ft_type='outlier',
                                        trainable_components=trainable_components,
+                                       weight_decay=args.weight_decay,
                                        verbose=args.verbose)
 
-    if args.fine_tune_type =='layernorm':
+    if args.fine_tune_type == 'layernorm':
         evaluator.training_preparation(learning_rate=args.learning_rate,
                                        encoder_trainable=False,
                                        ft_type='layernorm',
                                        trainable_components=trainable_components,
+                                       weight_decay=args.weight_decay,
                                        verbose=args.verbose)
 
     if args.fine_tune_type == 'bitfit_ln':
@@ -123,6 +134,7 @@ def _perform_training_preparations(evaluator, args, trainable_components):
                                        encoder_trainable=False,
                                        ft_type='bitfit_ln',
                                        trainable_components=trainable_components,
+                                       weight_decay=args.weight_decay,
                                        verbose=args.verbose)
 
     if args.fine_tune_type == 'lora_ln':
@@ -133,6 +145,7 @@ def _perform_training_preparations(evaluator, args, trainable_components):
                                        apply_lora=args.apply_lora,
                                        lora_alpha=args.lora_alpha,
                                        lora_r=args.lora_r,
+                                       weight_decay=args.weight_decay,
                                        verbose=args.verbose)
 
     if args.fine_tune_type == 'lora':
@@ -143,9 +156,8 @@ def _perform_training_preparations(evaluator, args, trainable_components):
                                        apply_lora=args.apply_lora,
                                        lora_alpha=args.lora_alpha,
                                        lora_r=args.lora_r,
+                                       weight_decay=args.weight_decay,
                                        verbose=args.verbose)
-
-
 def main():
     # args parsing
     args = _parse_args()

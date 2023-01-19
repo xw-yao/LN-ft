@@ -1,4 +1,5 @@
 from scipy.stats import spearmanr, pearsonr
+import math
 from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
 import numpy as np
 import pickle
@@ -8,7 +9,7 @@ from torch.optim import Adam
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from datasets import load_dataset
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig, OPTForCausalLM, GPT2Tokenizer
 from utils import setup_logging
 from datasets.arrow_dataset import Dataset
 import torch.nn as nn
@@ -45,6 +46,21 @@ TASK_TO_KEYS = {
     "wnli": ("sentence1", "sentence2"),
 }
 
+TASK_TO_PROMPT = {
+    "cola": """The following sentence is either "acceptable", meaning it is grammatically correct and makes sense, or "unacceptable". Which is it?\n{sentence1}\n{label}\n""",
+    "sst2": """{sentence1}\nWas that sentence "positive" or "negative"? It was {label}\n""",
+    "mrpc": """Does the sentence\n{sentence1}\nparaphrase (that is, mean the same thing as) this sentence? (yes or no)\n{sentence2}\n{label}\n""",
+    "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n{label}\n""",
+    "stsb": """Rate on a scale from 0.0 to 5.0 how similar the sentences "{sentence1}" and "{sentence2}" are.\n{label}\n""",  # note that you might need to round the labels to 1 digit after the comma
+}
+
+NUM_TO_TEXT = {
+    "cola": ["unacceptable", "acceptable"],
+    "sst2": ["negative", "positive"],
+    "mrpc": ["no", "yes"],
+    "qqp": ["no", "yes"],
+}
+
 BIAS_TERMS_DICT = {
     'intermediate': 'intermediate.dense.bias',
     'key': 'attention.self.key.bias',
@@ -54,6 +70,7 @@ BIAS_TERMS_DICT = {
     'layernorm': 'LayerNorm',
     'output_layernorm': 'output.LayerNorm.bias',
     'attention_layernorm': 'attention.output.LayerNorm.bias',
+    'lora': 'lora',
     'all': 'bias',
 }
 
@@ -84,12 +101,17 @@ class glue_evaluator:
         self.data_loaders = None
         self.batch_size = None
         self.model = None
+        self.tokenizer = None
+        self.model2 = None
+        self.scheduler = None
         self.optimizer = None
         self.learning_rate = None
         self.evaluations = None
         self.encoder_trainable = None
         self.masks = None
         self.idx_to_label = None
+        self.epochs = None
+        self.init_out_ln_params = []
 
     def preprocess_dataset(self, padding, max_sequence_len, batch_size):
         """Preprocess the train and validation datasets.
@@ -103,7 +125,12 @@ class glue_evaluator:
         datasets = load_dataset('glue', self.task_name)
 
         self.batch_size = batch_size
-        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        if self.model_name == 'opt':
+            self.tokenizer = GPT2Tokenizer.from_pretrained("facebook/opt-350m")
+            self.tokenizer.padding_side = 'left'
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
         is_regression = self.task_name == "stsb"
         if not is_regression:
@@ -115,16 +142,35 @@ class glue_evaluator:
 
         sentence1_key, sentence2_key = TASK_TO_KEYS[self.task_name]
 
+        def _prompt_preprocess_function(examples):
+            prompted_example = (TASK_TO_PROMPT[self.task_name].format(sentence1=examples[sentence1_key],
+                                                                      label=NUM_TO_TEXT[self.task_name][examples[
+                                                                          'label']]),) if sentence2_key is None else (
+                TASK_TO_PROMPT[self.task_name].format(sentence1=examples[sentence1_key],
+                                                      sentence2=examples[sentence2_key],
+                                                      label=NUM_TO_TEXT[self.task_name][examples['label']])
+            )
+            result = self.tokenizer(*prompted_example, padding=padding, max_length=max_sequence_len, truncation=True)
+            return result
+
+
         def _preprocess_function(examples):
             # Tokenize the texts
             args = (
                 (examples[sentence1_key],) if sentence2_key is None else (
                     examples[sentence1_key], examples[sentence2_key])
             )
-            result = tokenizer(*args, padding=padding, max_length=max_sequence_len, truncation=True)
+            result = self.tokenizer(*args, padding=padding, max_length=max_sequence_len, truncation=True)
             return result
 
-        datasets = datasets.map(_preprocess_function, batched=True, load_from_cache_file=False)
+        if self.model_name == 'opt':
+            datasets = datasets.map(_prompt_preprocess_function)
+        else:
+            datasets = datasets.map(_preprocess_function, batched=True, load_from_cache_file=False)
+
+        # print(datasets['train']['sentence'][:10])
+        # print(datasets['train']['input_ids'][:2])
+        # exit()
 
         self.data_loaders = dict()
 
@@ -146,7 +192,7 @@ class glue_evaluator:
                                                                                    random_sampler=dataset_name == 'train',
                                                                                    test='test' in dataset_name)
 
-    def training_preparation(self, learning_rate, encoder_trainable, ft_type=None, trainable_components=None, verbose=True):
+    def training_preparation(self, learning_rate, encoder_trainable, weight_decay, lora_alpha=None, lora_r=None, ft_type=None, apply_lora=False, trainable_components=None, verbose=True):
         """Performs training preparation.
         Perform training preparation including: model initialization, optimizer initialization, relevant
         gradients deactivation and plotting a list of all trainable params (if verbose is True).
@@ -166,17 +212,26 @@ class glue_evaluator:
 
         self.encoder_trainable = encoder_trainable
         # model declaration
-        if apply_lora:
-            config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, apply_lora=True, lora_alpha=lora_alpha, lora_r=lora_r, return_dict=True)
+        if self.model_name == 'opt':
+            self.model = OPTForCausalLM.from_pretrained("facebook/opt-350m")
         else:
-            config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, return_dict=True)
+            if apply_lora:
+                config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, apply_lora=True, lora_alpha=lora_alpha, lora_r=lora_r, return_dict=True)
+            else:
+                config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, return_dict=True)
+            self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name, config=config)
 
-        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name, config=config)
+        if ft_type == 'outlier':
+            self.model2 = AutoModelForSequenceClassification.from_pretrained(self.model_name, config=config)
+            for name, param in self.model2.named_parameters():
+                if 'LayerNorm' in name and not any(x in name for x in ['attention', 'embeddings']):
+                    param.requires_grad = False
+                    self.init_out_ln_params.append(param)
 
         if not encoder_trainable:
             self._deactivate_relevant_gradients(ft_type, trainable_components)
 
-        self.optimizer = AdamW(self.model.parameters(), lr=learning_rate, correct_bias=True)
+        self.optimizer = AdamW(self.model.parameters(), lr=learning_rate, correct_bias=True, eps=1e-8, weight_decay=weight_decay)
 
         self.learning_rate = learning_rate
 
@@ -220,10 +275,12 @@ class glue_evaluator:
         warmup_steps = math.ceil(t_total * warmup_ratio)
         self.scheduler = get_linear_schedule_with_warmup(self.optimizer, num_warmup_steps=warmup_steps,
                                                          num_training_steps=t_total)
-
         for epoch in range(num_epochs):
+
             # training for a single epoch
+            #print(f'init_param: {self.init_out_ln_params[0]}')
             self._train(self.data_loaders['train'], epoch, ft_type=ft_type)
+            # print(f'init_param: {self.init_out_ln_params[0]}')
 
             # evaluation
             if not epoch % evaluation_frequency:
@@ -233,6 +290,7 @@ class glue_evaluator:
                         for metric_name, result in results.items():
                             self.evaluations[dataloader_type][metric_name].append(result)
             print('')
+        #print(time_log)
 
     def save(self, output_path):
         """Saves the evaluator to the output_path directory.
@@ -242,12 +300,18 @@ class glue_evaluator:
         LOGGER.info(f'Saving the model to: {output_path}')
 
         self.model.cpu()
-        data = {'model': self.model, 'model_name': self.model_name, 'task_name': self.task_name,
+        data = {'model_name': self.model_name, 'task_name': self.task_name, 'num_epochs': self.epochs,
                 'learning_rate': self.learning_rate, 'evaluations': self.evaluations,
                 'batch_size': self.batch_size, 'num_labels': self.num_labels,
                 'encoder_trainable': self.encoder_trainable}
         with open(output_path, 'wb') as file:
             pickle.dump(data, file)
+
+    def _update_outlier_params(self, params):
+        for param1, param2 in zip(self.init_out_ln_params, params):
+            for dim in range(768):
+                if dim != 308 and dim != 381:
+                    param2[dim] = param1[dim]
 
     @staticmethod
     def load(path, gpu_device):
@@ -343,27 +407,33 @@ class glue_evaluator:
         criteria = torch.nn.MSELoss() if self.is_regression else torch.nn.CrossEntropyLoss()
 
         n = len(train_dataloader.dataset)
+
         trained_samples = loss_sum = 0
         for step, batch in enumerate(train_dataloader):
             # move batch data to gpu
             if self.device is not None:
                 batch = tuple(obj.cuda(self.device) for obj in batch)
 
-            if 'roberta' in self.model_name:
+            if 'roberta' in self.model_name or 'opt' in self.model_name:
                 input_ids, attention_mask, labels = batch
                 token_type_ids = None
             else:
                 input_ids, attention_mask, token_type_ids, labels = batch
 
             # forward pass
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-            outputs = outputs.logits
-
             # loss calculation
-            labels = labels.view(-1)
-            outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
-
-            loss = criteria(outputs, labels)
+            if 'opt' in self.model_name:
+                targets = input_ids.clone()
+                targets[targets == self.tokenizer.pad_token_id] = -100
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=targets)
+                loss = outputs.loss
+                labels = labels.view(-1)
+            else:
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                outputs = outputs.logits
+                labels = labels.view(-1)
+                outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
+                loss = criteria(outputs, labels)
 
             # backward pass (gradients calculation)
             loss.backward()
@@ -372,6 +442,7 @@ class glue_evaluator:
             if self.masks:
                 if 'roberta' in self.model_name:
                     for name, param in self.model.roberta.named_parameters():
+                        param.grad[~self.masks[name]] = 0
                         param.grad[~self.masks[name]] = 0
                 else:
                     for name, param in self.model.bert.named_parameters():
@@ -382,6 +453,7 @@ class glue_evaluator:
 
             # update parameters
             self.optimizer.step()
+            #print(f'param: {self.init_out_ln_params[0]}')
 
             if ft_type == 'outlier':
                 for param in self.model.parameters():
@@ -395,6 +467,7 @@ class glue_evaluator:
                         idx += 1
                         param.requires_grad = True
                 self.optimizer.step()
+            #print(f'param2: {self.init_out_ln_params[0]}')
 
             self.scheduler.step()
             self.model.zero_grad()
@@ -421,11 +494,12 @@ class glue_evaluator:
         evaluated_samples = accuracy_sum = 0
         all_predictions, all_labels = [], []
         for step, batch in enumerate(dataloader):
+            prompt_preds, prompt_labels = [], []
             # move batch data to gpu
             if self.device is not None:
                 batch = tuple(obj.cuda(self.device) for obj in batch)
 
-            if 'roberta' in self.model_name:
+            if 'roberta' in self.model_name or 'opt' in self.model_name:
                 input_ids, attention_mask, labels = batch
                 token_type_ids = None
             else:
@@ -433,30 +507,51 @@ class glue_evaluator:
 
             # forward pass
             with torch.no_grad():
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-                outputs = outputs.logits
+                if 'opt' in self.model_name:
+                    for idx in range(len(self.batch_size)):
+                        outputs = self.model.generate(input_ids=input_ids[idx], attention_mask=attention_mask[idx], max_new_tokens=5)
+                        n_input_tokens = len(input_ids[idx])
+                        response_ids = outputs[n_input_tokens:]
+                        pred = self.tokenizer.decode(response_ids,
+                                                    skip_special_tokens=True,
+                                                    clean_up_tokenization_spaces=False)
+                        prompt_preds.append(pred)
+                        prompt_labels.append(labels[idx])
+                        evaluated_samples += len(labels[idx])
 
-            # reshaping
-            labels = labels.view(-1)
-            outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
+                    # calculate the accuracy in the classification case
+                    if not self.is_regression:
+                        # accuracy calculation
+                        accuracy_sum += accuracy_score(prompt_labels, prompt_preds) * len(labels)
+                        print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
-            # moving tensor to cpu and detaching for aggregation
-            outputs = outputs.detach().cpu().numpy()
-            labels = labels.cpu().numpy()
+                    # aggregate predictions and labels
+                    all_predictions.extend(prompt_preds)
+                    all_labels.extend(prompt_labels)
 
-            evaluated_samples += len(labels)
+                else:
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                    outputs = outputs.logits
+                    # reshaping
+                    labels = labels.view(-1)
+                    outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
 
-            # calculate the accuracy in the classification case
-            if not self.is_regression:
-                outputs = np.argmax(outputs, axis=1)
-                # accuracy calculation
-                accuracy_sum += accuracy_score(labels, outputs) * len(labels)
-                print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
+                    # moving tensor to cpu and detaching for aggregation
+                    outputs = outputs.detach().cpu().numpy()
+                    labels = labels.cpu().numpy()
+                    evaluated_samples += len(labels)
 
+                    # calculate the accuracy in the classification case
+                    if not self.is_regression:
+                        outputs = np.argmax(outputs, axis=1)
+                        # accuracy calculation
+                        accuracy_sum += accuracy_score(labels, outputs) * len(labels)
+                        print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
-            # aggregate predictions and labels
-            all_predictions.extend(list(outputs))
-            all_labels.extend(list(labels))
+                    # aggregate predictions and labels
+                    all_predictions.extend(list(outputs))
+                    all_labels.extend(list(labels))
+
         print('')
 
         # calculate the required metrics
@@ -486,7 +581,7 @@ class glue_evaluator:
         else:
             keys = ['input_ids', 'attention_mask', 'token_type_ids', 'label']
 
-        if 'roberta' in model_name:
+        if 'roberta' in model_name or 'opt' in model_name:
             keys.remove('token_type_ids')
 
         data = {key: list() for key in keys}
