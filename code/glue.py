@@ -46,12 +46,20 @@ TASK_TO_KEYS = {
     "wnli": ("sentence1", "sentence2"),
 }
 
-TASK_TO_PROMPT = {
+TASK_TO_PROMPT_TRAIN = {
     "cola": """The following sentence is either "acceptable", meaning it is grammatically correct and makes sense, or "unacceptable". Which is it?\n{sentence1}\n{label}\n""",
     "sst2": """{sentence1}\nWas that sentence "positive" or "negative"? It was {label}\n""",
     "mrpc": """Does the sentence\n{sentence1}\nparaphrase (that is, mean the same thing as) this sentence? (yes or no)\n{sentence2}\n{label}\n""",
     "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n{label}\n""",
     "stsb": """Rate on a scale from 0.0 to 5.0 how similar the sentences "{sentence1}" and "{sentence2}" are.\n{label}\n""",  # note that you might need to round the labels to 1 digit after the comma
+}
+
+TASK_TO_PROMPT_EVAL = {
+    "cola": """The following sentence is either "acceptable", meaning it is grammatically correct and makes sense, or "unacceptable". Which is it?\n{sentence1}\n""",
+    "sst2": """{sentence1}\nWas that sentence "positive" or "negative"? It was """,
+    "mrpc": """Does the sentence\n{sentence1}\nparaphrase (that is, mean the same thing as) this sentence? (yes or no)\n{sentence2}\n""",
+    "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n""",
+    "stsb": """Rate on a scale from 0.0 to 5.0 how similar the sentences "{sentence1}" and "{sentence2}" are.\n""",  # note that you might need to round the labels to 1 digit after the comma
 }
 
 NUM_TO_TEXT = {
@@ -142,17 +150,24 @@ class glue_evaluator:
 
         sentence1_key, sentence2_key = TASK_TO_KEYS[self.task_name]
 
-        def _prompt_preprocess_function(examples):
-            prompted_example = (TASK_TO_PROMPT[self.task_name].format(sentence1=examples[sentence1_key],
-                                                                      label=NUM_TO_TEXT[self.task_name][examples[
-                                                                          'label']]),) if sentence2_key is None else (
-                TASK_TO_PROMPT[self.task_name].format(sentence1=examples[sentence1_key],
-                                                      sentence2=examples[sentence2_key],
-                                                      label=NUM_TO_TEXT[self.task_name][examples['label']])
+        def _generate_train_prompts(examples):
+            prompted_example = (TASK_TO_PROMPT_TRAIN[self.task_name].format(sentence1=examples[sentence1_key],
+                                                                            label=NUM_TO_TEXT[self.task_name][examples['label']])) if sentence2_key is None else \
+                (TASK_TO_PROMPT_TRAIN[self.task_name].format(sentence1=examples[sentence1_key],
+                                                             sentence2=examples[sentence2_key],
+                                                             label=NUM_TO_TEXT[self.task_name][examples['label']])
             )
-            result = self.tokenizer(*prompted_example, padding=padding, max_length=max_sequence_len, truncation=True)
+            result = self.tokenizer(prompted_example, padding=padding, max_length=max_sequence_len, truncation=True)
             return result
 
+        def _generate_eval_prompts(examples):
+            prompted_example = (
+                TASK_TO_PROMPT_EVAL[self.task_name].format(sentence1=examples[sentence1_key])) if sentence2_key is None else (
+                TASK_TO_PROMPT_EVAL[self.task_name].format(sentence1=examples[sentence1_key],
+                                                           sentence2=examples[sentence2_key])
+            )
+            result = self.tokenizer(prompted_example, padding=padding, max_length=max_sequence_len, truncation=True)
+            return result
 
         def _preprocess_function(examples):
             # Tokenize the texts
@@ -164,13 +179,11 @@ class glue_evaluator:
             return result
 
         if self.model_name == 'opt':
-            datasets = datasets.map(_prompt_preprocess_function)
+            datasets['train'] = datasets['train'].map(_generate_train_prompts, load_from_cache_file=False)
+            datasets['validation'] = datasets['validation'].map(_generate_eval_prompts, load_from_cache_file=False)
+            datasets['test'] = datasets['test'].map(_generate_eval_prompts, load_from_cache_file=False)
         else:
             datasets = datasets.map(_preprocess_function, batched=True, load_from_cache_file=False)
-
-        # print(datasets['train']['sentence'][:10])
-        # print(datasets['train']['input_ids'][:2])
-        # exit()
 
         self.data_loaders = dict()
 
@@ -191,6 +204,8 @@ class glue_evaluator:
                                                                                    batch_size=self.batch_size,
                                                                                    random_sampler=dataset_name == 'train',
                                                                                    test='test' in dataset_name)
+        # print(self.data_loaders.items())
+        # exit()
 
     def training_preparation(self, learning_rate, encoder_trainable, weight_decay, lora_alpha=None, lora_r=None, ft_type=None, apply_lora=False, trainable_components=None, verbose=True):
         """Performs training preparation.
@@ -246,10 +261,9 @@ class glue_evaluator:
             print(
                 f'\n----------------------------------------\nNumber of Trainable Parameters: {total_trainable_params}\n')
 
-        self.evaluations = {k: {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]} for k in
-                            self.data_loaders.keys()}
+        self.evaluations = {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]}
 
-    def train_and_evaluate(self, num_epochs, gradient_accumulation_steps, warmup_ratio, ft_type=None, evaluation_frequency=1):
+    def train_and_evaluate(self, num_epochs, gradient_accumulation_steps, warmup_ratio, ft_type=None):
         """Trains the encoder model and evaluate it on validation set.
         Learning curves will be saved to the output_path.
         Args:
@@ -270,25 +284,27 @@ class glue_evaluator:
 
         # train and evaluate
         self.epochs = num_epochs
-        n = len(self.data_loaders['train'].dataset)
-        t_total = n // gradient_accumulation_steps * num_epochs
-        warmup_steps = math.ceil(t_total * warmup_ratio)
-        self.scheduler = get_linear_schedule_with_warmup(self.optimizer, num_warmup_steps=warmup_steps,
-                                                         num_training_steps=t_total)
+        # n = len(self.data_loaders['train'].dataset)
+        # t_total = n // gradient_accumulation_steps * num_epochs
+        # warmup_steps = math.ceil(t_total * warmup_ratio)
+        # self.scheduler = get_linear_schedule_with_warmup(self.optimizer, num_warmup_steps=warmup_steps,
+        #                                                  num_training_steps=t_total)
         for epoch in range(num_epochs):
-
             # training for a single epoch
             #print(f'init_param: {self.init_out_ln_params[0]}')
             self._train(self.data_loaders['train'], epoch, ft_type=ft_type)
             # print(f'init_param: {self.init_out_ln_params[0]}')
 
             # evaluation
-            if not epoch % evaluation_frequency:
-                for dataloader_type, dataloader in self.data_loaders.items():
-                    if not ('test' in dataloader_type):
-                        results = self._evaluate(dataloader, dataloader_type.upper())
-                        for metric_name, result in results.items():
-                            self.evaluations[dataloader_type][metric_name].append(result)
+            results = self._evaluate(self.data_loaders['validation'])
+            for metric_name, result in results.items():
+                self.evaluations[metric_name].append(result)
+
+            # for dataloader_type, dataloader in self.data_loaders.items():
+            #     if not ('test' in dataloader_type):
+            #         results = self._evaluate(dataloader, dataloader_type.upper())
+            #         for metric_name, result in results.items():
+            #             self.evaluations[dataloader_type][metric_name].append(result)
             print('')
         #print(time_log)
 
@@ -410,6 +426,7 @@ class glue_evaluator:
 
         trained_samples = loss_sum = 0
         for step, batch in enumerate(train_dataloader):
+
             # move batch data to gpu
             if self.device is not None:
                 batch = tuple(obj.cuda(self.device) for obj in batch)
@@ -469,7 +486,7 @@ class glue_evaluator:
                 self.optimizer.step()
             #print(f'param2: {self.init_out_ln_params[0]}')
 
-            self.scheduler.step()
+            #self.scheduler.step()
             self.model.zero_grad()
 
             # track train loss
@@ -480,7 +497,7 @@ class glue_evaluator:
             print(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r', end='')
         print('')
 
-    def _evaluate(self, dataloader, dataloader_type):
+    def _evaluate(self, eval_dataloader):
         """Evaluates the model on the dataloader
         Args:
             dataloader (torch.utils.data.DataLoader): the data loader we evaluate the model on
@@ -493,8 +510,8 @@ class glue_evaluator:
 
         evaluated_samples = accuracy_sum = 0
         all_predictions, all_labels = [], []
-        for step, batch in enumerate(dataloader):
-            prompt_preds, prompt_labels = [], []
+        for step, batch in enumerate(eval_dataloader):
+            prompt_preds, true_labels = [], []
             # move batch data to gpu
             if self.device is not None:
                 batch = tuple(obj.cuda(self.device) for obj in batch)
@@ -508,26 +525,35 @@ class glue_evaluator:
             # forward pass
             with torch.no_grad():
                 if 'opt' in self.model_name:
-                    for idx in range(len(self.batch_size)):
-                        outputs = self.model.generate(input_ids=input_ids[idx], attention_mask=attention_mask[idx], max_new_tokens=5)
+                    outputs = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=5)
+
+                    for idx in range(len(input_ids)):
                         n_input_tokens = len(input_ids[idx])
-                        response_ids = outputs[n_input_tokens:]
+                        # print(f'n_input_tokens {n_input_tokens}')
+                        # print(f'output length: {len(outputs[idx])}')
+                        response_ids = outputs[idx][n_input_tokens:]
+                        # print(f'response_ids: {response_ids}')
+                        # exit()
                         pred = self.tokenizer.decode(response_ids,
                                                     skip_special_tokens=True,
                                                     clean_up_tokenization_spaces=False)
+                        true_label = NUM_TO_TEXT[self.task_name][labels[idx]]
                         prompt_preds.append(pred)
-                        prompt_labels.append(labels[idx])
-                        evaluated_samples += len(labels[idx])
+                        true_labels.append(true_label)
+
+                    evaluated_samples += len(labels)
+                    # print(f'pred labels: {prompt_preds}')
+                    # print(f'true labels: {true_labels}')
 
                     # calculate the accuracy in the classification case
                     if not self.is_regression:
                         # accuracy calculation
-                        accuracy_sum += accuracy_score(prompt_labels, prompt_preds) * len(labels)
-                        print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
+                        accuracy_sum += accuracy_score(true_labels, prompt_preds) * len(labels)
+                        print(f'VALID ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
                     # aggregate predictions and labels
                     all_predictions.extend(prompt_preds)
-                    all_labels.extend(prompt_labels)
+                    all_labels.extend(true_labels)
 
                 else:
                     outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
@@ -546,7 +572,7 @@ class glue_evaluator:
                         outputs = np.argmax(outputs, axis=1)
                         # accuracy calculation
                         accuracy_sum += accuracy_score(labels, outputs) * len(labels)
-                        print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
+                        print(f'VALID ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
                     # aggregate predictions and labels
                     all_predictions.extend(list(outputs))
