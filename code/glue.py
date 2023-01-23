@@ -18,7 +18,7 @@ import wandb
 
 setup_logging()
 LOGGER = logging.getLogger(__file__)
-wandb.init(project="pe-ft", entity="xwynlp")
+wandb.init(project="opt350m-full_ft-sst2", entity="xwynlp")
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -71,12 +71,6 @@ NUM_TO_TEXT = {
     "qqp": ["no", "yes"],
 }
 
-TEXT_TO_NUM = {
-    "cola": {"unacceptable": 0,  "acceptable": 1},
-    "sst2": {"negative": 0, "positive": 1},
-    "mrpc": {"no": 0, "yes": 1},
-    "qqp": {"no": 0, "yes": 1},
-}
 BIAS_TERMS_DICT = {
     'intermediate': 'intermediate.dense.bias',
     'key': 'attention.self.key.bias',
@@ -573,7 +567,7 @@ class glue_evaluator:
         evaluated_samples = accuracy_sum = 0
         all_predictions, all_labels = [], []
         for step, batch in enumerate(eval_dataloader):
-            prompt_preds = []
+            prompt_preds, true_labels = [], []
             # move batch data to gpu
             if self.device is not None:
                 batch = tuple(obj.cuda(self.device) for obj in batch)
@@ -587,7 +581,7 @@ class glue_evaluator:
             # forward pass
             with torch.no_grad():
                 if 'opt' in self.model_name:
-                    outputs = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=5)
+                    outputs = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=1)
 
                     for idx in range(len(input_ids)):
                         n_input_tokens = len(input_ids[idx])
@@ -599,8 +593,9 @@ class glue_evaluator:
                         pred = self.tokenizer.decode(response_ids,
                                                     skip_special_tokens=True,
                                                     clean_up_tokenization_spaces=False)
-                        pred = TEXT_TO_NUM[self.task_name][pred]
+                        true_label = NUM_TO_TEXT[self.task_name][labels[idx]]
                         prompt_preds.append(pred)
+                        true_labels.append(true_label)
 
                     labels = labels.view(-1)
                     labels = labels.cpu().numpy()
@@ -612,12 +607,13 @@ class glue_evaluator:
                     # calculate the accuracy in the classification case
                     if not self.is_regression:
                         # accuracy calculation
-                        accuracy_sum += accuracy_score(labels, prompt_preds) * len(labels)
+                        accuracy_sum += accuracy_score(true_labels, prompt_preds) * len(labels)
                         print(f'VALID ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
                     # aggregate predictions and labels
                     all_predictions.extend(prompt_preds)
-                    all_labels.extend(labels)
+                    all_labels.extend(true_labels)
+
 
                 else:
                     outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
@@ -647,8 +643,12 @@ class glue_evaluator:
         # calculate the required metrics
         results = {}
         for metric_name in TASK_TO_METRICS[self.task_name]:
-            metric = METRIC_NAME_TO_FUNCTION[metric_name]
-            result = metric(all_labels, all_predictions)
+            if 'F1' in metric_name and 'opt' in self.model_name:
+                metric = METRIC_NAME_TO_FUNCTION[metric_name]
+                result = metric(all_labels, all_predictions, average='micro')
+            else:
+                metric = METRIC_NAME_TO_FUNCTION[metric_name]
+                result = metric(all_labels, all_predictions)
             result = result[0] if self.is_regression else result
             results[metric_name] = result
 
