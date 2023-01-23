@@ -9,14 +9,16 @@ from torch.optim import Adam
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from datasets import load_dataset
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig, OPTForCausalLM, GPT2Tokenizer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig, OPTForCausalLM,  GPT2Tokenizer
 from utils import setup_logging
 from datasets.arrow_dataset import Dataset
 import torch.nn as nn
+import wandb
 
 
 setup_logging()
 LOGGER = logging.getLogger(__file__)
+wandb.init(project="pe-ft", entity="xwynlp")
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -69,6 +71,12 @@ NUM_TO_TEXT = {
     "qqp": ["no", "yes"],
 }
 
+TEXT_TO_NUM = {
+    "cola": {"unacceptable": 0,  "acceptable": 1},
+    "sst2": {"negative": 0, "positive": 1},
+    "mrpc": {"no": 0, "yes": 1},
+    "qqp": {"no": 0, "yes": 1},
+}
 BIAS_TERMS_DICT = {
     'intermediate': 'intermediate.dense.bias',
     'key': 'attention.self.key.bias',
@@ -108,6 +116,7 @@ class glue_evaluator:
         self.num_labels = None
         self.data_loaders = None
         self.batch_size = None
+        self.opt_train_btach = None
         self.model = None
         self.tokenizer = None
         self.model2 = None
@@ -179,6 +188,7 @@ class glue_evaluator:
             return result
 
         if self.model_name == 'opt':
+            datasets['train'] = load_dataset('glue', self.task_name, split='train[:16]')
             datasets['train'] = datasets['train'].map(_generate_train_prompts, load_from_cache_file=False)
             datasets['validation'] = datasets['validation'].map(_generate_eval_prompts, load_from_cache_file=False)
             datasets['test'] = datasets['test'].map(_generate_eval_prompts, load_from_cache_file=False)
@@ -203,6 +213,7 @@ class glue_evaluator:
                                                                                    model_name=self.model_name,
                                                                                    batch_size=self.batch_size,
                                                                                    random_sampler=dataset_name == 'train',
+                                                                                   train='train' in dataset_name,
                                                                                    test='test' in dataset_name)
         # print(self.data_loaders.items())
         # exit()
@@ -364,10 +375,16 @@ class glue_evaluator:
                         param.requires_grad = True
                         break
 
+        if ft_type == 'bitfit' and 'opt' in self.model_name:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            for name, param in self.model.named_parameters():
+                if trainable_components[0] in name:
+                    param.requires_grad = True
+
         if ft_type == 'outlier':
             for param in self.model.parameters():
                 param.requires_grad = False
-
             for name, param in self.model.named_parameters():
                 if trainable_components[0] in name and not any(x in name for x in ['attention', 'embeddings']):
                     param.requires_grad = True
@@ -376,6 +393,16 @@ class glue_evaluator:
             for name, param in self.model.named_parameters():
                 if not trainable_components[0] in name:
                     param.requires_grad = False
+
+        if ft_type == 'layernorm' and 'opt' in self.model_name:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            trainable_components = trainable_components + ['final_layer_norm']
+            for name, param in self.model.named_parameters():
+                for component in trainable_components:
+                    if component in name:
+                        param.requires_grad = True
+                        break
 
         if ft_type == 'bitfit_ln':
             for param in self.model.parameters():
@@ -386,6 +413,21 @@ class glue_evaluator:
                     if component in name:
                         param.requires_grad = True
                         break
+
+        if ft_type == 'bitfit_ln' and 'opt' in self.model_name:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            trainable_components = trainable_components + ['final_layer_norm']
+            for name, param in self.model.named_parameters():
+                for component in trainable_components:
+                    if component in name:
+                        param.requires_grad = True
+                        break
+
+        if ft_type == 'lora':
+            for name, param in self.model.named_parameters():
+                if not trainable_components[0] in name:
+                    param.requires_grad = False
 
         if ft_type == 'lora_ln':
             for param in self.model.parameters():
@@ -398,10 +440,17 @@ class glue_evaluator:
                         param.requires_grad = True
                         break
 
-        if ft_type == 'lora':
+        if ft_type == 'lora_ln' and 'opt' in self.model_name:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            if trainable_components:
+                trainable_components = trainable_components + ['final_layer_norm']
             for name, param in self.model.named_parameters():
-                if not trainable_components[0] in name:
-                    param.requires_grad = False
+                for component in trainable_components:
+                    if component in name:
+                        param.requires_grad = True
+                        break
+
 
 
     @staticmethod
@@ -416,6 +465,17 @@ class glue_evaluator:
             max_grad_norm (float): the maximum gradient norm we allow. The norm is computed over all gradients together,
             as if they were concatenated into a single vector.
         """
+
+        if 'opt' in self.model_name:
+            wandb.config = {
+            "learning_rate": self.learning_rate,
+            "epochs": self.epochs,
+            "batch_size": self.opt_train_btach}
+        else:
+            wandb.config = {
+                "learning_rate": self.learning_rate,
+                "epochs": self.epochs,
+                "batch_size": self.batch_size}
         # move to train mode
         self.model.train()
 
@@ -444,6 +504,7 @@ class glue_evaluator:
                 targets[targets == self.tokenizer.pad_token_id] = -100
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=targets)
                 loss = outputs.loss
+                wandb.log({"loss": loss})
                 labels = labels.view(-1)
             else:
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
@@ -451,6 +512,7 @@ class glue_evaluator:
                 labels = labels.view(-1)
                 outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
                 loss = criteria(outputs, labels)
+                wandb.log({"loss": loss})
 
             # backward pass (gradients calculation)
             loss.backward()
@@ -511,7 +573,7 @@ class glue_evaluator:
         evaluated_samples = accuracy_sum = 0
         all_predictions, all_labels = [], []
         for step, batch in enumerate(eval_dataloader):
-            prompt_preds, true_labels = [], []
+            prompt_preds = []
             # move batch data to gpu
             if self.device is not None:
                 batch = tuple(obj.cuda(self.device) for obj in batch)
@@ -537,9 +599,11 @@ class glue_evaluator:
                         pred = self.tokenizer.decode(response_ids,
                                                     skip_special_tokens=True,
                                                     clean_up_tokenization_spaces=False)
-                        true_label = NUM_TO_TEXT[self.task_name][labels[idx]]
+                        pred = TEXT_TO_NUM[self.task_name][pred]
                         prompt_preds.append(pred)
-                        true_labels.append(true_label)
+
+                    labels = labels.view(-1)
+                    labels = labels.cpu().numpy()
 
                     evaluated_samples += len(labels)
                     # print(f'pred labels: {prompt_preds}')
@@ -548,12 +612,12 @@ class glue_evaluator:
                     # calculate the accuracy in the classification case
                     if not self.is_regression:
                         # accuracy calculation
-                        accuracy_sum += accuracy_score(true_labels, prompt_preds) * len(labels)
+                        accuracy_sum += accuracy_score(labels, prompt_preds) * len(labels)
                         print(f'VALID ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
                     # aggregate predictions and labels
                     all_predictions.extend(prompt_preds)
-                    all_labels.extend(true_labels)
+                    all_labels.extend(labels)
 
                 else:
                     outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
@@ -590,8 +654,8 @@ class glue_evaluator:
 
         return results
 
-    @staticmethod
-    def _convert_dataset_to_data_loader(dataset, model_name, batch_size, random_sampler, test=False):
+    # @staticmethod
+    def _convert_dataset_to_data_loader(self, dataset, model_name, batch_size, random_sampler, train=False, test=False):
         """converts a datasets.arrow_dataset.Dataset to torch.utils.data.DataLoader.
         Args:
             dataset (datasets.arrow_dataset.Dataset): the Dataset to convert to DataLoader.
@@ -609,6 +673,11 @@ class glue_evaluator:
 
         if 'roberta' in model_name or 'opt' in model_name:
             keys.remove('token_type_ids')
+
+        if 'opt' in model_name and train:
+            batch_size = self.opt_train_btach = 1
+        else:
+            batch_size = batch_size
 
         data = {key: list() for key in keys}
         for sample in dataset:

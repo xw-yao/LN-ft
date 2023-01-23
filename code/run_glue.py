@@ -32,7 +32,7 @@ def _parse_args():
                         choices={'full_ft', 'bitfit', 'outlier', 'layernorm', 'bitfit_ln', 'lora', 'lora_ln'})
     parser.add_argument('--param-terms', metavar='N', type=str, nargs='+', default=['all'],
                         choices={'intermediate', 'key', 'query', 'value', 'output', 'layernorm', 'output_layernorm',
-                                 'attention_layernorm', 'lora', 'all'},
+                                 'attention_layernorm', 'self_attn_layer_norm', 'lora', 'all'},
                         help='bias terms to BitFit, should be given in case --fine-tune-type is bitfit '
                              '(choose \'all\' for BitFit all bias terms)')
     parser.add_argument('--gpu-device', '-d', type=int, default=None,
