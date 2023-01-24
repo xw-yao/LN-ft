@@ -1,24 +1,31 @@
-from scipy.stats import spearmanr, pearsonr
 import math
-from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
-import numpy as np
 import pickle
 import logging
+
 import torch
+import torch.nn as nn
 from torch.optim import Adam
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
-from datasets import load_dataset
+
+import numpy as np
+from scipy.stats import spearmanr, pearsonr
+from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig, OPTForCausalLM,  GPT2Tokenizer
-from utils import setup_logging
+from datasets import load_dataset
 from datasets.arrow_dataset import Dataset
-import torch.nn as nn
+
 import wandb
+
+from utils import setup_logging
+from lora_opt.modeling_opt import OPTForCausalLM
+from lora_opt.configuration_opt import OPTConfig  # local version that is modified for lora
 
 
 setup_logging()
 LOGGER = logging.getLogger(__file__)
-wandb.init(project="opt350m-full_ft-sst2", entity="xwynlp")
+
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -50,7 +57,7 @@ TASK_TO_KEYS = {
 
 TASK_TO_PROMPT_TRAIN = {
     "cola": """The following sentence is either "acceptable", meaning it is grammatically correct and makes sense, or "unacceptable". Which is it?\n{sentence1}\n{label}\n""",
-    "sst2": """{sentence1}\nWas that sentence "positive" or "negative"? It was {label}\n""",
+    "sst2": """{sentence1}\nWas that sentence "positive" or "negative"? It was\n{label}\n""",
     "mrpc": """Does the sentence\n{sentence1}\nparaphrase (that is, mean the same thing as) this sentence? (yes or no)\n{sentence2}\n{label}\n""",
     "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n{label}\n""",
     "stsb": """Rate on a scale from 0.0 to 5.0 how similar the sentences "{sentence1}" and "{sentence2}" are.\n{label}\n""",  # note that you might need to round the labels to 1 digit after the comma
@@ -58,7 +65,7 @@ TASK_TO_PROMPT_TRAIN = {
 
 TASK_TO_PROMPT_EVAL = {
     "cola": """The following sentence is either "acceptable", meaning it is grammatically correct and makes sense, or "unacceptable". Which is it?\n{sentence1}\n""",
-    "sst2": """{sentence1}\nWas that sentence "positive" or "negative"? It was """,
+    "sst2": """{sentence1}\nWas that sentence "positive" or "negative"? It was\n""",
     "mrpc": """Does the sentence\n{sentence1}\nparaphrase (that is, mean the same thing as) this sentence? (yes or no)\n{sentence2}\n""",
     "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n""",
     "stsb": """Rate on a scale from 0.0 to 5.0 how similar the sentences "{sentence1}" and "{sentence2}" are.\n""",  # note that you might need to round the labels to 1 digit after the comma
@@ -78,6 +85,7 @@ BIAS_TERMS_DICT = {
     'value': 'attention.self.value.bias',
     'output': 'output.dense.bias',
     'layernorm': 'LayerNorm',
+    'self_attn_layer_norm': 'self_attn_layer_norm',
     'output_layernorm': 'output.LayerNorm.bias',
     'attention_layernorm': 'attention.output.LayerNorm.bias',
     'lora': 'lora',
@@ -136,8 +144,8 @@ class glue_evaluator:
         datasets = load_dataset('glue', self.task_name)
 
         self.batch_size = batch_size
-        if self.model_name == 'opt':
-            self.tokenizer = GPT2Tokenizer.from_pretrained("facebook/opt-350m")
+        if "opt" in self.model_name:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             self.tokenizer.padding_side = 'left'
             self.tokenizer.pad_token = self.tokenizer.eos_token
         else:
@@ -181,8 +189,8 @@ class glue_evaluator:
             result = self.tokenizer(*args, padding=padding, max_length=max_sequence_len, truncation=True)
             return result
 
-        if self.model_name == 'opt':
-            datasets['train'] = load_dataset('glue', self.task_name, split='train[:16]')
+        if 'opt' in self.model_name:
+            #datasets['train'] = load_dataset('glue', self.task_name, split='train[:16]')
             datasets['train'] = datasets['train'].map(_generate_train_prompts, load_from_cache_file=False)
             datasets['validation'] = datasets['validation'].map(_generate_eval_prompts, load_from_cache_file=False)
             datasets['test'] = datasets['test'].map(_generate_eval_prompts, load_from_cache_file=False)
@@ -207,7 +215,6 @@ class glue_evaluator:
                                                                                    model_name=self.model_name,
                                                                                    batch_size=self.batch_size,
                                                                                    random_sampler=dataset_name == 'train',
-                                                                                   train='train' in dataset_name,
                                                                                    test='test' in dataset_name)
         # print(self.data_loaders.items())
         # exit()
@@ -232,8 +239,14 @@ class glue_evaluator:
 
         self.encoder_trainable = encoder_trainable
         # model declaration
-        if self.model_name == 'opt':
-            self.model = OPTForCausalLM.from_pretrained("facebook/opt-350m")
+        if "opt" in self.model_name:
+            assert self.model_name != "opt"
+            if apply_lora:
+                config = OPTConfig.from_pretrained(self.model_name, apply_lora=True, lora_alpha=lora_alpha, lora_r=lora_r)
+                self.model = OPTForCausalLM.from_pretrained(self.model_name, config=config)
+            else:
+                config = OPTConfig.from_pretrained(self.model_name)
+                self.model = OPTForCausalLM.from_pretrained(self.model_name, config=config)
         else:
             if apply_lora:
                 config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, apply_lora=True, lora_alpha=lora_alpha, lora_r=lora_r, return_dict=True)
@@ -265,7 +278,7 @@ class glue_evaluator:
                         1]
             print(
                 f'\n----------------------------------------\nNumber of Trainable Parameters: {total_trainable_params}\n')
-
+            wandb.log({"total_trainable_params": total_trainable_params})
         self.evaluations = {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]}
 
     def train_and_evaluate(self, num_epochs, gradient_accumulation_steps, warmup_ratio, ft_type=None):
@@ -369,12 +382,25 @@ class glue_evaluator:
                         param.requires_grad = True
                         break
 
-        if ft_type == 'bitfit' and 'opt' in self.model_name:
+        if ft_type == 'bitfit_ln':
             for param in self.model.parameters():
                 param.requires_grad = False
+            trainable_components = trainable_components + ['classifier', 'pooler.dense.bias', 'LayerNorm']
             for name, param in self.model.named_parameters():
-                if trainable_components[0] in name:
-                    param.requires_grad = True
+                for component in trainable_components:
+                    if component in name:
+                        param.requires_grad = True
+                        break
+
+        if ft_type == 'bitfit_ln' and 'opt' in self.model_name:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            trainable_components = trainable_components + ['final_layer_norm']
+            for name, param in self.model.named_parameters():
+                for component in trainable_components:
+                    if component in name:
+                        param.requires_grad = True
+                        break
 
         if ft_type == 'outlier':
             for param in self.model.parameters():
@@ -389,26 +415,6 @@ class glue_evaluator:
                     param.requires_grad = False
 
         if ft_type == 'layernorm' and 'opt' in self.model_name:
-            for param in self.model.parameters():
-                param.requires_grad = False
-            trainable_components = trainable_components + ['final_layer_norm']
-            for name, param in self.model.named_parameters():
-                for component in trainable_components:
-                    if component in name:
-                        param.requires_grad = True
-                        break
-
-        if ft_type == 'bitfit_ln':
-            for param in self.model.parameters():
-                param.requires_grad = False
-            trainable_components = trainable_components + ['classifier', 'pooler.dense.bias', 'LayerNorm']
-            for name, param in self.model.named_parameters():
-                for component in trainable_components:
-                    if component in name:
-                        param.requires_grad = True
-                        break
-
-        if ft_type == 'bitfit_ln' and 'opt' in self.model_name:
             for param in self.model.parameters():
                 param.requires_grad = False
             trainable_components = trainable_components + ['final_layer_norm']
@@ -460,16 +466,6 @@ class glue_evaluator:
             as if they were concatenated into a single vector.
         """
 
-        if 'opt' in self.model_name:
-            wandb.config = {
-            "learning_rate": self.learning_rate,
-            "epochs": self.epochs,
-            "batch_size": self.opt_train_btach}
-        else:
-            wandb.config = {
-                "learning_rate": self.learning_rate,
-                "epochs": self.epochs,
-                "batch_size": self.batch_size}
         # move to train mode
         self.model.train()
 
@@ -479,13 +475,17 @@ class glue_evaluator:
         n = len(train_dataloader.dataset)
 
         trained_samples = loss_sum = 0
+        global_step = epoch * len(train_dataloader)
+        update_step = global_step  # // gradient_accumulation
         for step, batch in enumerate(train_dataloader):
+            global_step += 1
 
             # move batch data to gpu
             if self.device is not None:
                 batch = tuple(obj.cuda(self.device) for obj in batch)
 
             if 'roberta' in self.model_name or 'opt' in self.model_name:
+                # labels: LongTensor[batch_size, ???] is a tensor of 0, 1 indices — class ids from GLUE
                 input_ids, attention_mask, labels = batch
                 token_type_ids = None
             else:
@@ -498,7 +498,20 @@ class glue_evaluator:
                 targets[targets == self.tokenizer.pad_token_id] = -100
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=targets)
                 loss = outputs.loss
-                wandb.log({"loss": loss})
+
+                _predictions = torch.argmax(outputs.logits, dim=-1)
+                targets = targets[:, 1:]
+                _predictions = _predictions[:, :-1]  # double check that _predictions do not end on a token that is a part of the label
+                accuracy = (_predictions == targets) & (targets != -100)
+                accuracy = accuracy.sum()
+                accuracy = accuracy / torch.sum(targets != -100)
+
+                wandb.log({
+                    "loss": loss,
+                    "train_lm_accuracy": accuracy,
+                    "epoch": epoch,
+                    "update_step": update_step,
+                }, step=global_step)
                 labels = labels.view(-1)
             else:
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
@@ -506,7 +519,7 @@ class glue_evaluator:
                 labels = labels.view(-1)
                 outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
                 loss = criteria(outputs, labels)
-                wandb.log({"loss": loss})
+
 
             # backward pass (gradients calculation)
             loss.backward()
@@ -526,6 +539,7 @@ class glue_evaluator:
 
             # update parameters
             self.optimizer.step()
+            update_step += 1
             #print(f'param: {self.init_out_ln_params[0]}')
 
             if ft_type == 'outlier':
@@ -645,17 +659,19 @@ class glue_evaluator:
         for metric_name in TASK_TO_METRICS[self.task_name]:
             if 'F1' in metric_name and 'opt' in self.model_name:
                 metric = METRIC_NAME_TO_FUNCTION[metric_name]
-                result = metric(all_labels, all_predictions, average='micro')
+                result = metric(all_labels, all_predictions, average='macro')
             else:
                 metric = METRIC_NAME_TO_FUNCTION[metric_name]
                 result = metric(all_labels, all_predictions)
             result = result[0] if self.is_regression else result
             results[metric_name] = result
 
+        wandb.log({f"validation/{k}": v for k, v in results.items()})
+
         return results
 
     # @staticmethod
-    def _convert_dataset_to_data_loader(self, dataset, model_name, batch_size, random_sampler, train=False, test=False):
+    def _convert_dataset_to_data_loader(self, dataset, model_name, batch_size, random_sampler, test=False):
         """converts a datasets.arrow_dataset.Dataset to torch.utils.data.DataLoader.
         Args:
             dataset (datasets.arrow_dataset.Dataset): the Dataset to convert to DataLoader.
@@ -674,10 +690,7 @@ class glue_evaluator:
         if 'roberta' in model_name or 'opt' in model_name:
             keys.remove('token_type_ids')
 
-        if 'opt' in model_name and train:
-            batch_size = self.opt_train_btach = 1
-        else:
-            batch_size = batch_size
+        batch_size = batch_size
 
         data = {key: list() for key in keys}
         for sample in dataset:

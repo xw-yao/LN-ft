@@ -8,6 +8,9 @@ import argparse
 import os
 import logging
 
+import torch
+import wandb
+
 from utils import setup_logging
 from glue import glue_evaluator, set_seed
 
@@ -16,6 +19,7 @@ LOGGER = logging.getLogger(__file__)
 
 PADDING = "max_length"
 MAX_SEQUENCE_LEN = 128
+
 
 def _parse_args():
     parser = argparse.ArgumentParser(description='BitFit GLUE evaluation',
@@ -26,7 +30,7 @@ def _parse_args():
     parser.add_argument('--task-name', '-t', required=True, type=str, help='GLUE task name for evaluation.',
                         choices={'cola', 'mnli', 'mrpc', 'qnli', 'qqp', 'rte', 'sst2', 'stsb', 'wnli'})
     parser.add_argument('--model-name', '-m', type=str, default='bert-base-cased', help='model-name to evaluate with.',
-                        choices={'bert-base-cased', 'bert-large-cased', 'roberta-base', 'opt'})
+                        choices={'bert-base-cased', 'bert-large-cased', 'roberta-base', 'facebook/opt-350m'})
     parser.add_argument('--fine-tune-type', '-f', required=True, type=str,
                         help='Which fine tuning process to perform, types are the types that were performed in BitFit paper.',
                         choices={'full_ft', 'bitfit', 'outlier', 'layernorm', 'bitfit_ln', 'lora', 'lora_ln'})
@@ -37,6 +41,8 @@ def _parse_args():
                              '(choose \'all\' for BitFit all bias terms)')
     parser.add_argument('--gpu-device', '-d', type=int, default=None,
                         help='GPU id for BitFit, if not mentioned will train on CPU.')
+    parser.add_argument('--dtype', '-dt', type=str, choices={'float32', 'bfloat16'}, default="float32",
+                        help='choose dtype between float32 and bfloat16')
     parser.add_argument('--seed', '-s', type=int, default=0, help='seed value to set.')
     parser.add_argument('--learning-rate', '-l', type=float, default=1e-3, help='learning rate for training.')
     parser.add_argument('--epochs', '-e', type=int, default=15, help='number of training epochs.')
@@ -164,27 +170,41 @@ def main():
     _validate_args(args)
     _plot_training_details(args)
 
+    wandb.init(
+        project="ft-opt",
+        group='opt350m-loraln-sst2',
+        entity="xwynlp",
+        config=vars(args),
+    )
+
     # seed
     set_seed(args.seed)
 
-    # evaluator creation
-    evaluator = glue_evaluator(args.task_name, args.model_name, args.gpu_device)
+    if args.dtype == "float32":
+        dtype = torch.float32
+    elif args.dtype == "bfloat16":  # only works on new GPUs, 30XX, A100, A6000 and so on
+        dtype = torch.bfloat16
+    else:
+        raise ValueError(args.dtype)
 
-    # data preprocessing
-    evaluator.preprocess_dataset(PADDING, MAX_SEQUENCE_LEN, args.batch_size)
+    with torch.autocast(device_type='cuda', dtype=dtype):
+        # evaluator creation
+        evaluator = glue_evaluator(args.task_name, args.model_name, args.gpu_device)
 
-    # training preparation
-    trainable_components = glue_evaluator.convert_to_actual_components(args.param_terms)
+        # data preprocessing
+        evaluator.preprocess_dataset(PADDING, MAX_SEQUENCE_LEN, args.batch_size)
 
-    _perform_training_preparations(evaluator, args, trainable_components)
+        # training preparation
+        trainable_components = glue_evaluator.convert_to_actual_components(args.param_terms)
 
-    # train and evaluate
-    evaluator.train_and_evaluate(args.epochs, args.gradient_accumulation_steps, args.warmup_ratio, ft_type=args.fine_tune_type)
+        _perform_training_preparations(evaluator, args, trainable_components)
 
-    # save model
-    if args.save_evaluator:
-        evaluator.save(os.path.join(args.output_path, 'evaluator'))
+        # train and evaluate
+        evaluator.train_and_evaluate(args.epochs, args.gradient_accumulation_steps, args.warmup_ratio, ft_type=args.fine_tune_type)
 
+        # save model
+        if args.save_evaluator:
+            evaluator.save(os.path.join(args.output_path, 'evaluator'))
 
 
 if __name__ == '__main__':
