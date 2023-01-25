@@ -273,8 +273,8 @@ class glue_evaluator:
             total_parameters = sum(p.numel() for p in self.model.parameters())
             total_trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             print(f'\n----------------------------------------')
-            print(f'Total Parameters: {total_parameters / 1e6:.2}M')
-            print(f'Number of Trainable Parameters: {total_trainable_params / 1e6:.2}M\n')
+            print(f'Total Parameters              : {total_parameters / 1e6:>10.2f} M')
+            print(f'Number of Trainable Parameters: {total_trainable_params / 1e6:>10.2f} M\n')
             wandb.log({"total_trainable_params": total_trainable_params})
         self.evaluations = {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]}
 
