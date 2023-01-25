@@ -31,7 +31,7 @@ def _parse_args():
                         choices={'cola', 'mnli', 'mrpc', 'qnli', 'qqp', 'rte', 'sst2', 'stsb', 'wnli'})
     parser.add_argument('--model-name', '-m', type=str, default='bert-base-cased', help='model-name to evaluate with.',
                         choices={'bert-base-cased', 'bert-large-cased', 'roberta-base', 'facebook/opt-350m', 'facebook/opt-30b',
-                                  'facebook/opt-13b'})
+                                  'facebook/opt-13b', 'facebook/opt-1.3b', 'facebook/opt-2.7b'})
     parser.add_argument('--fine-tune-type', '-f', required=True, type=str,
                         help='Which fine tuning process to perform, types are the types that were performed in BitFit paper.',
                         choices={'full_ft', 'bitfit', 'outlier', 'layernorm', 'bitfit_ln', 'lora', 'lora_ln'})
@@ -173,7 +173,7 @@ def main():
 
     wandb.init(
         project="ft-opt",
-        group='opt13b-layernorm-bfloat-mrpc-a100',
+        group='bert-stsb-lora',
         entity="xwynlp",
         config=vars(args),
     )

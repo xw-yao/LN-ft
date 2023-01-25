@@ -531,12 +531,19 @@ class glue_evaluator:
                     accuracy_sum += accuracy_score(labels, outputs) * len(labels)
                     accuracy = round(accuracy_sum / evaluated_samples, 5)
 
-                wandb.log({
-                    "loss": loss,
-                    "train_lm_accuracy": accuracy,
-                    "epoch": epoch,
-                    "update_step": update_step,
-                }, step=global_step)
+                    wandb.log({
+                        "loss": loss,
+                        "train_accuracy": accuracy,
+                        "epoch": epoch,
+                        "update_step": update_step,
+                        }, step=global_step)
+
+                else:
+                    wandb.log({
+                        "loss": loss,
+                        "epoch": epoch,
+                        "update_step": update_step,
+                    }, step=global_step)
 
 
             # backward pass (gradients calculation)
