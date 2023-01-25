@@ -290,7 +290,7 @@ class glue_evaluator:
 
         # moving model to the required device
         if self.device is not None:
-            self.model.to(device=self.device, dtype=self.dtype)
+            self.model.to(device=torch.device(self.device), dtype=self.dtype)
 
         # train and evaluate
         self.epochs = num_epochs
