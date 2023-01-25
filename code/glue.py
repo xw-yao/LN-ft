@@ -11,7 +11,7 @@ import numpy as np
 from scipy.stats import spearmanr, pearsonr
 from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
 
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
+from transformers import AutoTokenizer
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
 from datasets import load_dataset
 from datasets.arrow_dataset import Dataset
@@ -21,7 +21,8 @@ import wandb
 from utils import setup_logging
 from lora_opt.modeling_opt import OPTForCausalLM
 from lora_opt.configuration_opt import OPTConfig  # local version that is modified for lora
-
+from lora_bert.modeling_bert import BertForSequenceClassification
+from lora_bert.configuration_bert import BertConfig
 
 setup_logging()
 LOGGER = logging.getLogger(__file__)
@@ -249,10 +250,10 @@ class glue_evaluator:
                 self.model = OPTForCausalLM.from_pretrained(self.model_name, config=config)
         else:
             if apply_lora:
-                config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, apply_lora=True, lora_alpha=lora_alpha, lora_r=lora_r, return_dict=True)
+                config = BertConfig.from_pretrained(self.model_name, num_labels=self.num_labels, apply_lora=True, lora_alpha=lora_alpha, lora_r=lora_r, return_dict=True)
             else:
-                config = AutoConfig.from_pretrained(self.model_name, num_labels=self.num_labels, return_dict=True)
-            self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name, config=config)
+                config = BertConfig.from_pretrained(self.model_name, num_labels=self.num_labels, return_dict=True)
+            self.model = BertForSequenceClassification.from_pretrained(self.model_name, config=config)
 
         if ft_type == 'outlier':
             self.model2 = AutoModelForSequenceClassification.from_pretrained(self.model_name, config=config)
@@ -474,7 +475,7 @@ class glue_evaluator:
 
         n = len(train_dataloader.dataset)
 
-        trained_samples = loss_sum = 0
+        evaluated_samples = accuracy_sum = trained_samples = loss_sum = 0
         global_step = epoch * len(train_dataloader)
         update_step = global_step  # // gradient_accumulation
         for step, batch in enumerate(train_dataloader):
@@ -519,6 +520,23 @@ class glue_evaluator:
                 labels = labels.view(-1)
                 outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
                 loss = criteria(outputs, labels)
+                evaluated_samples += len(labels)
+
+                # calculate the accuracy in the classification case
+                if not self.is_regression:
+                    outputs = outputs.detach().cpu().numpy()
+                    labels = labels.cpu().numpy()
+                    outputs = np.argmax(outputs, axis=1)
+                    # accuracy calculation
+                    accuracy_sum += accuracy_score(labels, outputs) * len(labels)
+                    accuracy = round(accuracy_sum / evaluated_samples, 5)
+
+                wandb.log({
+                    "loss": loss,
+                    "train_lm_accuracy": accuracy,
+                    "epoch": epoch,
+                    "update_step": update_step,
+                }, step=global_step)
 
 
             # backward pass (gradients calculation)
