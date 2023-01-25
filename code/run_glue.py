@@ -29,9 +29,7 @@ def _parse_args():
                         help='output directory path for evaluation products.')
     parser.add_argument('--task-name', '-t', required=True, type=str, help='GLUE task name for evaluation.',
                         choices={'cola', 'mnli', 'mrpc', 'qnli', 'qqp', 'rte', 'sst2', 'stsb', 'wnli'})
-    parser.add_argument('--model-name', '-m', type=str, default='bert-base-cased', help='model-name to evaluate with.',
-                        choices={'bert-base-cased', 'bert-large-cased', 'roberta-base', 'facebook/opt-350m', 'facebook/opt-30b',
-                                  'facebook/opt-13b'})
+    parser.add_argument('--model-name', '-m', type=str, default='bert-base-cased', help='model-name to evaluate with.')
     parser.add_argument('--fine-tune-type', '-f', required=True, type=str,
                         help='Which fine tuning process to perform, types are the types that were performed in BitFit paper.',
                         choices={'full_ft', 'bitfit', 'outlier', 'layernorm', 'bitfit_ln', 'lora', 'lora_ln'})
