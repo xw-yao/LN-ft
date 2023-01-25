@@ -109,7 +109,10 @@ class glue_evaluator:
         self.task_name = task_name
         self.model_name = model_name
         self.device = device
+
         self.dtype = dtype or torch.float32
+        if isinstance(self.dtype, str):
+            self.dtype = getattr(torch, self.dtype)
 
         # initialization
         self.is_regression = task_name == 'stsb'
