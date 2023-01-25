@@ -1,10 +1,7 @@
-import math
 import pickle
 import logging
 
 import torch
-import torch.nn as nn
-from torch.optim import Adam
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
 import numpy as np
@@ -12,9 +9,8 @@ from scipy.stats import spearmanr, pearsonr
 from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
 
 from transformers import AutoTokenizer
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup
+from transformers.optimization import AdamW
 from datasets import load_dataset
-from datasets.arrow_dataset import Dataset
 
 import wandb
 
@@ -103,7 +99,7 @@ METRIC_NAME_TO_FUNCTION = {
 
 class glue_evaluator:
 
-    def __init__(self, task_name, model_name, device):
+    def __init__(self, task_name, model_name, device, dtype=None):
         """
         Args:
             task_name (str): task name, e.g. 'rte'.
@@ -113,6 +109,7 @@ class glue_evaluator:
         self.task_name = task_name
         self.model_name = model_name
         self.device = device
+        self.dtype = dtype or torch.float32
 
         # initialization
         self.is_regression = task_name == 'stsb'
@@ -270,15 +267,9 @@ class glue_evaluator:
         self.learning_rate = learning_rate
 
         if verbose:
-            print('\n\nTrainable Components:\n----------------------------------------\n')
-            total_trainable_params = 0
-            for name, param in self.model.named_parameters():
-                if param.requires_grad:
-                    print(name, '  --->  ', param.shape)
-                    total_trainable_params += param.shape[0] if len(param.shape) == 1 else param.shape[0] * param.shape[
-                        1]
-            print(
-                f'\n----------------------------------------\nNumber of Trainable Parameters: {total_trainable_params}\n')
+            total_trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            print(f'\n----------------------------------------')
+            print(f'Number of Trainable Parameters: {total_trainable_params}\n')
             wandb.log({"total_trainable_params": total_trainable_params})
         self.evaluations = {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]}
 
@@ -299,33 +290,37 @@ class glue_evaluator:
 
         # moving model to the required device
         if self.device is not None:
-            self.model.cuda(self.device)
+            self.model.to(device=self.device, dtype=self.dtype)
 
         # train and evaluate
         self.epochs = num_epochs
+        # scheduler was turned off for the main experiments
+
         # n = len(self.data_loaders['train'].dataset)
         # t_total = n // gradient_accumulation_steps * num_epochs
         # warmup_steps = math.ceil(t_total * warmup_ratio)
         # self.scheduler = get_linear_schedule_with_warmup(self.optimizer, num_warmup_steps=warmup_steps,
         #                                                  num_training_steps=t_total)
+        if gradient_accumulation_steps > 0:
+            print('----------------------------------------')
+            print(f'Using gradient accumulation with {gradient_accumulation_steps} steps')
+            print(f'Effective batch size is {self.batch_size * gradient_accumulation_steps}')
+
         for epoch in range(num_epochs):
             # training for a single epoch
-            #print(f'init_param: {self.init_out_ln_params[0]}')
-            self._train(self.data_loaders['train'], epoch, ft_type=ft_type)
-            # print(f'init_param: {self.init_out_ln_params[0]}')
+            self._train(
+                self.data_loaders['train'],
+                epoch,
+                ft_type=ft_type,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+            )
 
             # evaluation
             results = self._evaluate(self.data_loaders['validation'])
             for metric_name, result in results.items():
                 self.evaluations[metric_name].append(result)
 
-            # for dataloader_type, dataloader in self.data_loaders.items():
-            #     if not ('test' in dataloader_type):
-            #         results = self._evaluate(dataloader, dataloader_type.upper())
-            #         for metric_name, result in results.items():
-            #             self.evaluations[dataloader_type][metric_name].append(result)
             print('')
-        #print(time_log)
 
     def save(self, output_path):
         """Saves the evaluator to the output_path directory.
@@ -452,13 +447,18 @@ class glue_evaluator:
                         param.requires_grad = True
                         break
 
-
-
     @staticmethod
     def convert_to_actual_components(components):
         return [BIAS_TERMS_DICT[component] for component in components]
 
-    def _train(self, train_dataloader, epoch, ft_type=None, max_grad_norm=1.0):
+    def _train(
+        self,
+        train_dataloader,
+        epoch,
+        ft_type=None,
+        max_grad_norm=1.0,
+        gradient_accumulation_steps=1,
+    ):
         """Trains the model for a single epoch
         Args:
             train_dataloader (torch.utils.data.DataLoader): the train data loader
@@ -477,7 +477,7 @@ class glue_evaluator:
 
         evaluated_samples = accuracy_sum = trained_samples = loss_sum = 0
         global_step = epoch * len(train_dataloader)
-        update_step = global_step  # // gradient_accumulation
+        update_step = global_step // gradient_accumulation_steps + 1  # +1 to avoid potential logging collisions
         for step, batch in enumerate(train_dataloader):
             global_step += 1
 
@@ -486,7 +486,7 @@ class glue_evaluator:
                 batch = tuple(obj.cuda(self.device) for obj in batch)
 
             if 'roberta' in self.model_name or 'opt' in self.model_name:
-                # labels: LongTensor[batch_size, ???] is a tensor of 0, 1 indices — class ids from GLUE
+                # labels: LongTensor[batch_size,] is a tensor of 0, 1 indices — class ids from GLUE
                 input_ids, attention_mask, labels = batch
                 token_type_ids = None
             else:
@@ -498,7 +498,7 @@ class glue_evaluator:
                 targets = input_ids.clone()
                 targets[targets == self.tokenizer.pad_token_id] = -100
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=targets)
-                loss = outputs.loss
+                loss = outputs.loss / gradient_accumulation_steps  # divide by gradient_accumulation_steps to scale loss
 
                 _predictions = torch.argmax(outputs.logits, dim=-1)
                 targets = targets[:, 1:]
@@ -508,7 +508,7 @@ class glue_evaluator:
                 accuracy = accuracy / torch.sum(targets != -100)
 
                 wandb.log({
-                    "loss": loss,
+                    "loss": loss * gradient_accumulation_steps,  # report in-batch loss
                     "train_lm_accuracy": accuracy,
                     "epoch": epoch,
                     "update_step": update_step,
@@ -519,7 +519,7 @@ class glue_evaluator:
                 outputs = outputs.logits
                 labels = labels.view(-1)
                 outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
-                loss = criteria(outputs, labels)
+                loss = criteria(outputs, labels) / gradient_accumulation_steps
                 evaluated_samples += len(labels)
 
                 # calculate the accuracy in the classification case
@@ -538,8 +538,6 @@ class glue_evaluator:
                     "update_step": update_step,
                 }, step=global_step)
 
-
-            # backward pass (gradients calculation)
             loss.backward()
 
             # masking the relevant gradients (if needed)
@@ -556,26 +554,27 @@ class glue_evaluator:
             torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=max_grad_norm)
 
             # update parameters
-            self.optimizer.step()
-            update_step += 1
-            #print(f'param: {self.init_out_ln_params[0]}')
-
-            if ft_type == 'outlier':
-                for param in self.model.parameters():
-                    param.requires_grad = False
-                idx = 0
-                for name, param in self.model.named_parameters():
-                    if 'LayerNorm' in name and not any(x in name for x in ['attention', 'embeddings']):
-                        for dim in range(768):
-                            if dim != 308 and dim != 381:
-                                param[dim] = self.init_out_ln_params[idx][dim]
-                        idx += 1
-                        param.requires_grad = True
+            if (global_step + 1) % gradient_accumulation_steps == 0:
                 self.optimizer.step()
-            #print(f'param2: {self.init_out_ln_params[0]}')
+                update_step += 1
 
-            #self.scheduler.step()
-            self.model.zero_grad()
+                if ft_type == 'outlier':
+                    for param in self.model.parameters():
+                        param.requires_grad = False
+                    idx = 0
+                    for name, param in self.model.named_parameters():
+                        if 'LayerNorm' in name and not any(x in name for x in ['attention', 'embeddings']):
+                            for dim in range(768):
+                                if dim != 308 and dim != 381:
+                                    param[dim] = self.init_out_ln_params[idx][dim]
+                            idx += 1
+                            param.requires_grad = True
+                    self.optimizer.step()
+
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
+                self.model.zero_grad()
 
             # track train loss
             loss_sum += loss.item()

@@ -1,5 +1,3 @@
-import sys
-sys.path.append('./configuration_opt.py')
 # coding=utf-8
 # Copyright 2022 The Fairseq Authors and The HuggingFace Inc. team. All rights reserved.
 #
@@ -39,7 +37,7 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from configuration_opt import OPTConfig  # local import
+from .configuration_opt import OPTConfig  # local import
 
 
 logger = logging.get_logger(__name__)

@@ -173,8 +173,6 @@ def main():
 
     wandb.init(
         project="ft-opt",
-        group='opt13b-layernorm-bfloat-mrpc-a100',
-        entity="xwynlp",
         config=vars(args),
     )
 
@@ -190,7 +188,12 @@ def main():
 
     with torch.autocast(device_type='cuda', dtype=dtype):
         # evaluator creation
-        evaluator = glue_evaluator(args.task_name, args.model_name, args.gpu_device)
+        evaluator = glue_evaluator(
+            args.task_name,
+            model_name=args.model_name,
+            device=args.gpu_device,
+            dtype=args.dtype,
+        )
 
         # data preprocessing
         evaluator.preprocess_dataset(PADDING, MAX_SEQUENCE_LEN, args.batch_size)
