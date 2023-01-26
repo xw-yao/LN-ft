@@ -17,7 +17,7 @@ from glue import glue_evaluator, set_seed
 setup_logging()
 LOGGER = logging.getLogger(__file__)
 
-PADDING = "max_length"
+PADDING = 'max_length'
 MAX_SEQUENCE_LEN = 128
 
 
@@ -43,6 +43,7 @@ def _parse_args():
     parser.add_argument('--dtype', '-dt', type=str, choices={'float32', 'bfloat16'}, default="float32",
                         help='choose dtype between float32 and bfloat16')
     parser.add_argument('--seed', '-s', type=int, default=0, help='seed value to set.')
+    parser.add_argument('--sample-size', type=int, default=None, help='amount of data (integer) to sample from the training set for trainig in few- or limited-shot scenarios.')
     parser.add_argument('--learning-rate', '-l', type=float, default=1e-3, help='learning rate for training.')
     parser.add_argument('--epochs', '-e', type=int, default=15, help='number of training epochs.')
     parser.add_argument('--gradient-accumulation-steps', '-g', type=int, default=1, help='steps of gradient accumulation.')
@@ -103,7 +104,7 @@ def _plot_training_details(args):
      in range(3)]
 
 
-def _perform_training_preparations(evaluator, args, trainable_components):
+def _perform_training_preparations(evaluator: glue_evaluator, args, trainable_components):
     if args.fine_tune_type == 'full_ft':
         evaluator.training_preparation(learning_rate=args.learning_rate,
                                        encoder_trainable=True,
@@ -194,7 +195,13 @@ def main():
         )
 
         # data preprocessing
-        evaluator.preprocess_dataset(PADDING, MAX_SEQUENCE_LEN, args.batch_size)
+        evaluator.preprocess_dataset(
+            padding=PADDING,
+            max_sequence_len=MAX_SEQUENCE_LEN,
+            batch_size=args.batch_size,
+            sample_size=args.sample_size,
+            random_seed=args.seed,
+        )
 
         # training preparation
         trainable_components = glue_evaluator.convert_to_actual_components(args.param_terms)

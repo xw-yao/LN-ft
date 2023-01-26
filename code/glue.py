@@ -1,3 +1,5 @@
+import math
+import random
 import pickle
 import logging
 
@@ -8,11 +10,12 @@ import numpy as np
 from scipy.stats import spearmanr, pearsonr
 from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from transformers.optimization import AdamW
 from datasets import load_dataset
 
 import wandb
+from tqdm import tqdm
 
 from utils import setup_logging
 from lora_opt.modeling_opt import OPTForCausalLM
@@ -24,9 +27,68 @@ setup_logging()
 LOGGER = logging.getLogger(__file__)
 
 
+OPT_30B_DEVICE_MAP = {
+    'model.decoder.embed_tokens': 0,
+    'model.decoder.embed_positions': 0,
+    'model.decoder.layers.0': 0,
+    'model.decoder.layers.1': 0,
+    'model.decoder.layers.2': 0,
+    'model.decoder.layers.3': 0,
+    'model.decoder.layers.4': 0,
+    'model.decoder.layers.5': 0,
+    'model.decoder.layers.6': 0,
+    'model.decoder.layers.7': 0,
+    'model.decoder.layers.8': 0,
+    'model.decoder.layers.9': 0,
+    'model.decoder.layers.10': 0,
+    'model.decoder.layers.11': 0,
+    'model.decoder.layers.12': 0,
+    'model.decoder.layers.13': 0,
+    'model.decoder.layers.14': 0,
+    'model.decoder.layers.15': 0,
+    'model.decoder.layers.16': 0,
+    'model.decoder.layers.17': 0,
+    'model.decoder.layers.18': 0,
+    'model.decoder.layers.19': 0,
+    'model.decoder.layers.20': 0,
+    'model.decoder.layers.21': 0,
+    'model.decoder.layers.22': 0,
+    'model.decoder.layers.23': 0,
+    'model.decoder.layers.24': 1,
+    'model.decoder.layers.25': 1,
+    'model.decoder.layers.26': 1,
+    'model.decoder.layers.27': 1,
+    'model.decoder.layers.28': 1,
+    'model.decoder.layers.29': 1,
+    'model.decoder.layers.30': 1,
+    'model.decoder.layers.31': 1,
+    'model.decoder.layers.32': 1,
+    'model.decoder.layers.33': 1,
+    'model.decoder.layers.34': 1,
+    'model.decoder.layers.35': 1,
+    'model.decoder.layers.36': 1,
+    'model.decoder.layers.37': 1,
+    'model.decoder.layers.38': 1,
+    'model.decoder.layers.39': 1,
+    'model.decoder.layers.40': 1,
+    'model.decoder.layers.41': 1,
+    'model.decoder.layers.42': 1,
+    'model.decoder.layers.43': 1,
+    'model.decoder.layers.44': 1,
+    'model.decoder.layers.45': 1,
+    'model.decoder.layers.46': 1,
+    'model.decoder.layers.47': 1,
+    'model.decoder.final_layer_norm': 1,
+    'lm_head': 1,
+}
+
+
 def set_seed(seed):
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
 
 TASK_TO_METRICS = {
     "cola": ["MCC"],
@@ -58,6 +120,10 @@ TASK_TO_PROMPT_TRAIN = {
     "mrpc": """Does the sentence\n{sentence1}\nparaphrase (that is, mean the same thing as) this sentence? (yes or no)\n{sentence2}\n{label}\n""",
     "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n{label}\n""",
     "stsb": """Rate on a scale from 0.0 to 5.0 how similar the sentences "{sentence1}" and "{sentence2}" are.\n{label}\n""",  # note that you might need to round the labels to 1 digit after the comma
+    "mnli": """{sentence1}\nBased on the previous passage, is it true that "{sentence2}"? Yes, no, or maybe?\n{label}\n""",
+    "qnli": """Can you answer the question "{sentence1}" based only on the following: {sentence2}? (yes or no)\n{label}\n""",
+    "rte": """Does "{sentence1}" imply that "{sentence2}"? Please answer either "yes" or "no".\n{label}\n""",
+    "wnli": """{{sentence1}}\n{{sentence2}}\nDoes the first sentence imply the second sentence? (yes or no)\n{label}\n"""
 }
 
 TASK_TO_PROMPT_EVAL = {
@@ -66,6 +132,10 @@ TASK_TO_PROMPT_EVAL = {
     "mrpc": """Does the sentence\n{sentence1}\nparaphrase (that is, mean the same thing as) this sentence? (yes or no)\n{sentence2}\n""",
     "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n""",
     "stsb": """Rate on a scale from 0.0 to 5.0 how similar the sentences "{sentence1}" and "{sentence2}" are.\n""",  # note that you might need to round the labels to 1 digit after the comma
+    "mnli": """{sentence1}\nBased on the previous passage, is it true that "{sentence2}"? Yes, no, or maybe?\n""",
+    "qnli": """Can you answer the question "{sentence1}" based only on the following: {sentence2}? (yes or no)\n""",
+    "rte": """Does "{sentence1}" imply that "{sentence2}"? Please answer either "yes" or "no".\n""",
+    "wnli": """{{sentence1}}\n{{sentence2}}\nDoes the first sentence imply the second sentence? (yes or no)\n"""
 }
 
 NUM_TO_TEXT = {
@@ -73,6 +143,11 @@ NUM_TO_TEXT = {
     "sst2": ["negative", "positive"],
     "mrpc": ["no", "yes"],
     "qqp": ["no", "yes"],
+    "mnli": ["yes", "maybe", "no"],
+    "qnli": ["yes", "no"],
+    "rte": ["yes", "no"],
+    "wnli": ["no", "yes"],
+    "stsb": lambda x: round(x, 1),  # not tested yet
 }
 
 BIAS_TERMS_DICT = {
@@ -133,7 +208,7 @@ class glue_evaluator:
         self.epochs = None
         self.init_out_ln_params = []
 
-    def preprocess_dataset(self, padding, max_sequence_len, batch_size):
+    def preprocess_dataset(self, padding, max_sequence_len, batch_size, sample_size=None, random_seed=42):
         """Preprocess the train and validation datasets.
         Args:
             padding (str): padding method (currently 'max_length' is the suggested method)
@@ -144,21 +219,24 @@ class glue_evaluator:
         LOGGER.info(f'Downloading dataset: {self.task_name}')
         datasets = load_dataset('glue', self.task_name)
 
+        if sample_size is not None:
+            # make random indices and take a sample from the train dataset
+            subset_indices = np.random.RandomState(random_seed).permutation(len(datasets['train']))[:sample_size]
+            datasets['train'] = datasets['train'].select(subset_indices)
+
         self.batch_size = batch_size
-        if "opt" in self.model_name:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+
+        if 'opt' in self.model_name:
             self.tokenizer.padding_side = 'left'
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
-        is_regression = self.task_name == "stsb"
+        self.num_labels = 1
+        is_regression = self.task_name == 'stsb'
         if not is_regression:
-            label_list = datasets["train"].features["label"].names
+            label_list = datasets['train'].features['label'].names
             self.idx_to_label = {k: v for k, v in enumerate(datasets['train'].features['label'].__dict__['_int2str'])}
             self.num_labels = len(label_list)
-        else:
-            self.num_labels = 1
 
         sentence1_key, sentence2_key = TASK_TO_KEYS[self.task_name]
 
@@ -240,14 +318,27 @@ class glue_evaluator:
 
         self.encoder_trainable = encoder_trainable
         # model declaration
-        if "opt" in self.model_name:
-            assert self.model_name != "opt"
-            if apply_lora:
-                config = OPTConfig.from_pretrained(self.model_name, apply_lora=True, lora_alpha=lora_alpha, lora_r=lora_r)
-                self.model = OPTForCausalLM.from_pretrained(self.model_name, config=config)
-            else:
-                config = OPTConfig.from_pretrained(self.model_name)
-                self.model = OPTForCausalLM.from_pretrained(self.model_name, config=config)
+        if 'opt' in self.model_name:
+            assert self.model_name != 'opt'
+            config = OPTConfig.from_pretrained(
+                self.model_name,
+                apply_lora=apply_lora,
+                lora_alpha=lora_alpha if apply_lora else None,
+                lora_r=lora_r if apply_lora else None,
+            )
+
+            device_map = None
+            if self.model_name == 'facebook/opt-30b':
+                # doesn't work when we add parameters to the model (e.g. lora)
+                # needs modification in the .from_pretrained() method
+                device_map = 'auto'
+
+            self.model = OPTForCausalLM.from_pretrained(
+                self.model_name,
+                config=config,
+                device_map=device_map,
+                torch_dtype=self.dtype,
+            )
         else:
             if apply_lora:
                 config = BertConfig.from_pretrained(self.model_name, num_labels=self.num_labels, apply_lora=True, lora_alpha=lora_alpha, lora_r=lora_r, return_dict=True)
@@ -265,16 +356,22 @@ class glue_evaluator:
         if not encoder_trainable:
             self._deactivate_relevant_gradients(ft_type, trainable_components)
 
-        self.optimizer = AdamW(self.model.parameters(), lr=learning_rate, correct_bias=True, eps=1e-8, weight_decay=weight_decay)
+        self.optimizer = AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            correct_bias=True,
+            eps=1e-8,
+            weight_decay=weight_decay,
+        )
 
         self.learning_rate = learning_rate
 
         if verbose:
             total_parameters = sum(p.numel() for p in self.model.parameters())
             total_trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            print(f'\n----------------------------------------')
-            print(f'Total Parameters: {total_parameters / 1e6:.2}M')
-            print(f'Number of Trainable Parameters: {total_trainable_params / 1e6:.2}M\n')
+            print(f'\n-----------------------------------------------------------------')
+            print(f'Total Parameters              : {total_parameters / 1e6:>10.2f} M')
+            print(f'Number of Trainable Parameters: {total_trainable_params / 1e6:>10.2f} M\n')
             wandb.log({"total_trainable_params": total_trainable_params})
         self.evaluations = {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]}
 
@@ -294,18 +391,22 @@ class glue_evaluator:
             raise Exception('model was not initialized, please run "training_preparation" before training.')
 
         # moving model to the required device
-        if self.device is not None:
+        if self.model_name != "facebook/opt-30b" and self.device is not None:
+            # when working with 30B model we move it to the device in the model initialization via device_map
             self.model.to(device=torch.device(self.device), dtype=self.dtype)
 
         # train and evaluate
         self.epochs = num_epochs
-        # scheduler was turned off for the main experiments
 
-        # n = len(self.data_loaders['train'].dataset)
-        # t_total = n // gradient_accumulation_steps * num_epochs
-        # warmup_steps = math.ceil(t_total * warmup_ratio)
-        # self.scheduler = get_linear_schedule_with_warmup(self.optimizer, num_warmup_steps=warmup_steps,
-        #                                                  num_training_steps=t_total)
+        n = len(self.data_loaders['train'].dataset)
+        t_total = n // gradient_accumulation_steps * num_epochs
+        warmup_steps = math.ceil(t_total * warmup_ratio)
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=t_total,
+        )
+    
         if gradient_accumulation_steps > 0:
             print('----------------------------------------')
             print(f'Using gradient accumulation with {gradient_accumulation_steps} steps')
@@ -354,27 +455,6 @@ class glue_evaluator:
             for dim in range(768):
                 if dim != 308 and dim != 381:
                     param2[dim] = param1[dim]
-
-    @staticmethod
-    def load(path, gpu_device):
-        """Loads the evaluator from `path`.
-        Args:
-            path (str): Directory to load to model from.
-            gpu_device (int): GPU device ID.
-        Returns:
-            (GLUEvaluator): the GLUEvaluator instance we loaded
-        """
-        with open(path, 'rb') as file:
-            data = pickle.load(file)
-        evaluator = GLUEvaluator(data['task_name'], data['model_name'], gpu_device)
-        evaluator.num_labels = data['num_labels']
-        evaluator.batch_size = data['batch_size']
-        evaluator.model = data['model']
-        evaluator.learning_rate = data['learning_rate']
-        evaluator.evaluations = data['evaluations']
-        evaluator.encoder_trainable = data.get('encoder_trainable', None)
-
-        return evaluator
 
     def _deactivate_relevant_gradients(self, ft_type, trainable_components):
 
@@ -490,11 +570,15 @@ class glue_evaluator:
         evaluated_samples = accuracy_sum = trained_samples = loss_sum = 0
         global_step = epoch * len(train_dataloader)
         update_step = global_step // gradient_accumulation_steps + 1  # +1 to avoid potential logging collisions
-        for step, batch in enumerate(train_dataloader):
+
+        progress_bar = tqdm(train_dataloader, desc=f"EPOCH {epoch}")
+        for step, batch in enumerate(progress_bar):
             global_step += 1
 
             # move batch data to gpu
             if self.device is not None:
+                # if you're using model parallel, use --gpu-device 0 and specify GPUs in the environment variable CUDA_VISIBLE_DEVICES like this:
+                # export CUDA_VISIBLE_DEVICES=2,5
                 batch = tuple(obj.cuda(self.device) for obj in batch)
 
             if 'roberta' in self.model_name or 'opt' in self.model_name:
@@ -600,7 +684,9 @@ class glue_evaluator:
             trained_samples += len(labels)
 
             # printing training progress
-            print(f'EPOCH: {epoch}   TRAIN: {trained_samples}/{n}   LOSS: {round(loss_sum / (step + 1), 3)}\r', end='')
+            _loss_to_log = round(loss_sum / (step + 1), 3)
+            _accuracy_to_log = round(accuracy.item(), 3) if not self.is_regression else None
+            progress_bar.set_postfix({"loss": _loss_to_log, "accuracy": _accuracy_to_log})
         print('')
 
     def _evaluate(self, eval_dataloader):
