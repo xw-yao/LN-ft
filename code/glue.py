@@ -321,9 +321,16 @@ class glue_evaluator:
             )
 
             # evaluation
-            results = self._evaluate(self.data_loaders['validation'])
-            for metric_name, result in results.items():
-                self.evaluations[metric_name].append(result)
+            if self.task_name == 'mnli':
+                for dataloader_type, dataloader in self.data_loaders.items():
+                    if 'validation' in dataloader_type:
+                        results = self._evaluate(dataloader)
+                        for metric_name, result in results.items():
+                            self.evaluations[metric_name].append(result)
+            else:
+                results = self._evaluate(self.data_loaders['validation'])
+                for metric_name, result in results.items():
+                    self.evaluations[metric_name].append(result)
 
             print('')
 
