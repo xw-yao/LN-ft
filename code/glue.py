@@ -10,7 +10,7 @@ import numpy as np
 from scipy.stats import spearmanr, pearsonr
 from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score
 
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 from transformers.optimization import AdamW
 from datasets import load_dataset
 
@@ -25,6 +25,7 @@ from lora_bert.configuration_bert import BertConfig
 
 setup_logging()
 LOGGER = logging.getLogger(__file__)
+MAX_GRAD_NORM = 1.0
 
 
 OPT_30B_DEVICE_MAP = {
@@ -413,14 +414,137 @@ class glue_evaluator:
             print(f'Using gradient accumulation with {gradient_accumulation_steps} steps')
             print(f'Effective batch size is {self.batch_size * gradient_accumulation_steps}')
 
+        criteria = torch.nn.MSELoss() if self.is_regression else torch.nn.CrossEntropyLoss()
+
+        train_dataloader = self.data_loaders['train']
+        n = len(train_dataloader.dataset)
+        global_step = -1  # -1 because we increment it before the first step
+        update_step = 0  # 0 because it is logged before updating
+
         for epoch in range(num_epochs):
-            # training for a single epoch
-            self._train(
-                self.data_loaders['train'],
-                epoch,
-                ft_type=ft_type,
-                gradient_accumulation_steps=gradient_accumulation_steps,
-            )
+            global_step += 1
+            # move to train mode
+            self.model.train()
+
+            evaluated_samples = 0
+            loss_sum = 0
+
+            progress_bar = tqdm(train_dataloader, desc=f"EPOCH {epoch}")
+            for step, batch in enumerate(progress_bar):
+                global_step += 1
+
+                # move batch data to gpu
+                if self.device is not None:
+                    # if you're using model parallel, use --gpu-device 0 and specify GPUs in the environment variable CUDA_VISIBLE_DEVICES like this:
+                    # export CUDA_VISIBLE_DEVICES=2,5
+                    batch = tuple(obj.cuda(self.device) for obj in batch)
+
+                if 'roberta' in self.model_name or 'opt' in self.model_name:
+                    # labels: LongTensor[batch_size,] is a tensor of 0, 1 indices — class ids from GLUE
+                    # note that language loss is calculated using input_ids, we use labels for evaluation only
+                    input_ids, attention_mask, labels = batch
+                    token_type_ids = None
+                else:
+                    input_ids, attention_mask, token_type_ids, labels = batch
+
+                # forward pass
+                # loss calculation
+                if 'opt' in self.model_name:
+                    targets = input_ids.clone()
+                    targets[targets == self.tokenizer.pad_token_id] = -100
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=targets)
+                    loss = outputs.loss / gradient_accumulation_steps  # divide by gradient_accumulation_steps to scale loss
+
+                    _predictions = torch.argmax(outputs.logits, dim=-1)
+                    targets = targets[:, 1:]
+                    _predictions = _predictions[:, :-1]  # double check that _predictions do not end on a token that is a part of the label
+                    accuracy = (_predictions == targets) & (targets != -100)
+                    accuracy = accuracy.sum()
+                    accuracy = accuracy / torch.sum(targets != -100)
+
+                    wandb.log({
+                        "loss": loss * gradient_accumulation_steps,  # report in-batch loss
+                        "train_lm_accuracy": accuracy,
+                        "epoch": epoch,
+                        "update_step": update_step,
+                    }, step=global_step)
+                    labels = labels.view(-1)
+                else:
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+                    outputs = outputs.logits
+                    labels = labels.view(-1)
+                    outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
+                    loss = criteria(outputs, labels) / gradient_accumulation_steps
+                    evaluated_samples += len(labels)
+
+                    # calculate the accuracy in the classification case
+                    if not self.is_regression:
+                        outputs = outputs.detach().cpu().numpy()
+                        labels = labels.cpu().numpy()
+                        outputs = np.argmax(outputs, axis=1)
+                        # accuracy calculation
+                        accuracy = accuracy_score(labels, outputs)
+
+                        wandb.log({
+                            "loss": loss,
+                            "train_lm_accuracy": accuracy,
+                            "epoch": epoch,
+                            "update_step": update_step,
+                            }, step=global_step)
+
+                    else:
+                        wandb.log({
+                            "loss": loss,
+                            "epoch": epoch,
+                            "update_step": update_step,
+                        }, step=global_step)
+
+                loss.backward()
+
+                # masking the relevant gradients (if needed)
+                if self.masks:
+                    if 'roberta' in self.model_name:
+                        for name, param in self.model.roberta.named_parameters():
+                            param.grad[~self.masks[name]] = 0
+                            param.grad[~self.masks[name]] = 0
+                    else:
+                        for name, param in self.model.bert.named_parameters():
+                            param.grad[~self.masks[name]] = 0
+
+                # gradient clipping
+                torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=MAX_GRAD_NORM)
+
+                # update parameters
+                if (global_step + 1) % gradient_accumulation_steps == 0:
+                    self.optimizer.step()
+                    update_step += 1
+
+                    if ft_type == 'outlier':
+                        for param in self.model.parameters():
+                            param.requires_grad = False
+                        idx = 0
+                        for name, param in self.model.named_parameters():
+                            if 'LayerNorm' in name and not any(x in name for x in ['attention', 'embeddings']):
+                                for dim in range(768):
+                                    if dim != 308 and dim != 381:
+                                        param[dim] = self.init_out_ln_params[idx][dim]
+                                idx += 1
+                                param.requires_grad = True
+                        self.optimizer.step()
+
+                    if self.scheduler is not None:
+                        self.scheduler.step()
+
+                    self.model.zero_grad()
+
+                # track train loss
+                loss_sum += loss.item()
+
+                # printing training progress
+                _loss_to_log = round(loss_sum / (step + 1), 3)
+                _accuracy_to_log = round(accuracy.item(), 3) if not self.is_regression else None
+                progress_bar.set_postfix({"loss": _loss_to_log, "accuracy": _accuracy_to_log})
+            print()
 
             # evaluation
             for dataloader_type, dataloader in self.data_loaders.items():
@@ -428,8 +552,7 @@ class glue_evaluator:
                     results = self._evaluate(dataloader, dataloader_type)
                     for metric_name, result in results.items():
                         self.evaluations[dataloader_type][metric_name].append(result)
-
-            print('')
+            print()
 
     def save(self, output_path):
         """Saves the evaluator to the output_path directory.
@@ -539,152 +662,6 @@ class glue_evaluator:
     def convert_to_actual_components(components):
         return [BIAS_TERMS_DICT[component] for component in components]
 
-    def _train(
-        self,
-        train_dataloader,
-        epoch,
-        ft_type=None,
-        max_grad_norm=1.0,
-        gradient_accumulation_steps=1,
-    ):
-        """Trains the model for a single epoch
-        Args:
-            train_dataloader (torch.utils.data.DataLoader): the train data loader
-            epoch (int): the epoch number (for logging)
-            max_grad_norm (float): the maximum gradient norm we allow. The norm is computed over all gradients together,
-            as if they were concatenated into a single vector.
-        """
-
-        # move to train mode
-        self.model.train()
-
-        # loss initialization
-        criteria = torch.nn.MSELoss() if self.is_regression else torch.nn.CrossEntropyLoss()
-
-        n = len(train_dataloader.dataset)
-
-        evaluated_samples = accuracy_sum = trained_samples = loss_sum = 0
-        global_step = epoch * len(train_dataloader)
-        update_step = global_step // gradient_accumulation_steps + 1  # +1 to avoid potential logging collisions
-
-        progress_bar = tqdm(train_dataloader, desc=f"EPOCH {epoch}")
-        for step, batch in enumerate(progress_bar):
-            global_step += 1
-
-            # move batch data to gpu
-            if self.device is not None:
-                # if you're using model parallel, use --gpu-device 0 and specify GPUs in the environment variable CUDA_VISIBLE_DEVICES like this:
-                # export CUDA_VISIBLE_DEVICES=2,5
-                batch = tuple(obj.cuda(self.device) for obj in batch)
-
-            if 'roberta' in self.model_name or 'opt' in self.model_name:
-                # labels: LongTensor[batch_size,] is a tensor of 0, 1 indices — class ids from GLUE
-                input_ids, attention_mask, labels = batch
-                token_type_ids = None
-            else:
-                input_ids, attention_mask, token_type_ids, labels = batch
-
-            # forward pass
-            # loss calculation
-            if 'opt' in self.model_name:
-                targets = input_ids.clone()
-                targets[targets == self.tokenizer.pad_token_id] = -100
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=targets)
-                loss = outputs.loss / gradient_accumulation_steps  # divide by gradient_accumulation_steps to scale loss
-
-                _predictions = torch.argmax(outputs.logits, dim=-1)
-                targets = targets[:, 1:]
-                _predictions = _predictions[:, :-1]  # double check that _predictions do not end on a token that is a part of the label
-                accuracy = (_predictions == targets) & (targets != -100)
-                accuracy = accuracy.sum()
-                accuracy = accuracy / torch.sum(targets != -100)
-
-                wandb.log({
-                    "loss": loss * gradient_accumulation_steps,  # report in-batch loss
-                    "train_lm_accuracy": accuracy,
-                    "epoch": epoch,
-                    "update_step": update_step,
-                }, step=global_step)
-                labels = labels.view(-1)
-            else:
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-                outputs = outputs.logits
-                labels = labels.view(-1)
-                outputs = outputs.view(-1) if self.is_regression else outputs.view(-1, self.num_labels)
-                loss = criteria(outputs, labels) / gradient_accumulation_steps
-                evaluated_samples += len(labels)
-
-                # calculate the accuracy in the classification case
-                if not self.is_regression:
-                    outputs = outputs.detach().cpu().numpy()
-                    labels = labels.cpu().numpy()
-                    outputs = np.argmax(outputs, axis=1)
-                    # accuracy calculation
-                    accuracy_sum += accuracy_score(labels, outputs) * len(labels)
-                    accuracy = round(accuracy_sum / evaluated_samples, 5)
-
-                    wandb.log({
-                        "loss": loss,
-                        "train_lm_accuracy": accuracy,
-                        "epoch": epoch,
-                        "update_step": update_step,
-                        }, step=global_step)
-
-                else:
-                    wandb.log({
-                        "loss": loss,
-                        "epoch": epoch,
-                        "update_step": update_step,
-                    }, step=global_step)
-
-            loss.backward()
-
-            # masking the relevant gradients (if needed)
-            if self.masks:
-                if 'roberta' in self.model_name:
-                    for name, param in self.model.roberta.named_parameters():
-                        param.grad[~self.masks[name]] = 0
-                        param.grad[~self.masks[name]] = 0
-                else:
-                    for name, param in self.model.bert.named_parameters():
-                        param.grad[~self.masks[name]] = 0
-
-            # gradient clipping
-            torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=max_grad_norm)
-
-            # update parameters
-            if (global_step + 1) % gradient_accumulation_steps == 0:
-                self.optimizer.step()
-                update_step += 1
-
-                if ft_type == 'outlier':
-                    for param in self.model.parameters():
-                        param.requires_grad = False
-                    idx = 0
-                    for name, param in self.model.named_parameters():
-                        if 'LayerNorm' in name and not any(x in name for x in ['attention', 'embeddings']):
-                            for dim in range(768):
-                                if dim != 308 and dim != 381:
-                                    param[dim] = self.init_out_ln_params[idx][dim]
-                            idx += 1
-                            param.requires_grad = True
-                    self.optimizer.step()
-
-                if self.scheduler is not None:
-                    self.scheduler.step()
-
-                self.model.zero_grad()
-
-            # track train loss
-            loss_sum += loss.item()
-            trained_samples += len(labels)
-
-            # printing training progress
-            _loss_to_log = round(loss_sum / (step + 1), 3)
-            _accuracy_to_log = round(accuracy.item(), 3) if not self.is_regression else None
-            progress_bar.set_postfix({"loss": _loss_to_log, "accuracy": _accuracy_to_log})
-        print('')
-
     def _evaluate(self, eval_dataloader, dataloader_type):
         """Evaluates the model on the dataloader
         Args:
@@ -696,9 +673,11 @@ class glue_evaluator:
         # move to eval mode
         self.model.eval()
 
-        evaluated_samples = accuracy_sum = 0
+        evaluated_samples = 0
+        accuracy_sum = 0
         all_predictions, all_labels = [], []
-        for step, batch in enumerate(eval_dataloader):
+
+        for batch in eval_dataloader:
             prompt_preds, true_labels = [], []
             # move batch data to gpu
             if self.device is not None:
@@ -717,11 +696,7 @@ class glue_evaluator:
 
                     for idx in range(len(input_ids)):
                         n_input_tokens = len(input_ids[idx])
-                        # print(f'n_input_tokens {n_input_tokens}')
-                        # print(f'output length: {len(outputs[idx])}')
                         response_ids = outputs[idx][n_input_tokens:]
-                        # print(f'response_ids: {response_ids}')
-                        # exit()
                         pred = self.tokenizer.decode(response_ids,
                                                     skip_special_tokens=True,
                                                     clean_up_tokenization_spaces=False)
@@ -733,8 +708,6 @@ class glue_evaluator:
                     labels = labels.cpu().numpy()
 
                     evaluated_samples += len(labels)
-                    # print(f'pred labels: {prompt_preds}')
-                    # print(f'true labels: {true_labels}')
 
                     # calculate the accuracy in the classification case
                     if not self.is_regression:
@@ -769,8 +742,7 @@ class glue_evaluator:
                     # aggregate predictions and labels
                     all_predictions.extend(list(outputs))
                     all_labels.extend(list(labels))
-
-        print('')
+        print()
 
         # calculate the required metrics
         results = {}
@@ -784,13 +756,7 @@ class glue_evaluator:
             result = result[0] if self.is_regression else result
             results[metric_name] = result
 
-        if self.task_name == 'mnli':
-            if 'matched' in dataloader_type:
-                wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()})
-            if 'mismatched' in dataloader_type:
-                wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()})
-        else:
-            wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()})
+        wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()})
 
         return results
 
