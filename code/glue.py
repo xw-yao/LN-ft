@@ -373,7 +373,8 @@ class glue_evaluator:
             print(f'Total Parameters              : {total_parameters / 1e6:>10.2f} M')
             print(f'Number of Trainable Parameters: {total_trainable_params / 1e6:>10.2f} M\n')
             wandb.log({"total_trainable_params": total_trainable_params})
-        self.evaluations = {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]}
+        self.evaluations = {k: {metric_name: [] for metric_name in TASK_TO_METRICS[self.task_name]} for k in
+                            self.data_loaders.keys()}
 
     def train_and_evaluate(self, num_epochs, gradient_accumulation_steps, warmup_ratio, ft_type=None):
         """Trains the encoder model and evaluate it on validation set.
@@ -422,16 +423,11 @@ class glue_evaluator:
             )
 
             # evaluation
-            if self.task_name == 'mnli':
-                for dataloader_type, dataloader in self.data_loaders.items():
-                    if 'validation' in dataloader_type:
-                        results = self._evaluate(dataloader)
-                        for metric_name, result in results.items():
-                            self.evaluations[metric_name].append(result)
-            else:
-                results = self._evaluate(self.data_loaders['validation'])
-                for metric_name, result in results.items():
-                    self.evaluations[metric_name].append(result)
+            for dataloader_type, dataloader in self.data_loaders.items():
+                if 'validation' in dataloader_type:
+                    results = self._evaluate(dataloader, dataloader_type)
+                    for metric_name, result in results.items():
+                        self.evaluations[dataloader_type][metric_name].append(result)
 
             print('')
 
@@ -689,7 +685,7 @@ class glue_evaluator:
             progress_bar.set_postfix({"loss": _loss_to_log, "accuracy": _accuracy_to_log})
         print('')
 
-    def _evaluate(self, eval_dataloader):
+    def _evaluate(self, eval_dataloader, dataloader_type):
         """Evaluates the model on the dataloader
         Args:
             dataloader (torch.utils.data.DataLoader): the data loader we evaluate the model on
@@ -744,7 +740,7 @@ class glue_evaluator:
                     if not self.is_regression:
                         # accuracy calculation
                         accuracy_sum += accuracy_score(true_labels, prompt_preds) * len(labels)
-                        print(f'VALID ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
+                        print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
                     # aggregate predictions and labels
                     all_predictions.extend(prompt_preds)
@@ -768,7 +764,7 @@ class glue_evaluator:
                         outputs = np.argmax(outputs, axis=1)
                         # accuracy calculation
                         accuracy_sum += accuracy_score(labels, outputs) * len(labels)
-                        print(f'VALID ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
+                        print(f'{dataloader_type} ACC: {round(accuracy_sum / evaluated_samples, 5)}\r', end='')
 
                     # aggregate predictions and labels
                     all_predictions.extend(list(outputs))
@@ -788,7 +784,13 @@ class glue_evaluator:
             result = result[0] if self.is_regression else result
             results[metric_name] = result
 
-        wandb.log({f"validation/{k}": v for k, v in results.items()})
+        if self.task_name == 'mnli':
+            if 'matched' in dataloader_type:
+                wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()})
+            if 'mismatched' in dataloader_type:
+                wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()})
+        else:
+            wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()})
 
         return results
 
