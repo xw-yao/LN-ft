@@ -272,8 +272,16 @@ class glue_evaluator:
         if 'opt' in self.model_name:
             #datasets['train'] = load_dataset('glue', self.task_name, split='train[:16]')
             datasets['train'] = datasets['train'].map(_generate_train_prompts, load_from_cache_file=False)
-            datasets['validation'] = datasets['validation'].map(_generate_eval_prompts, load_from_cache_file=False)
-            datasets['test'] = datasets['test'].map(_generate_eval_prompts, load_from_cache_file=False)
+
+            if self.task_name != 'mnli':
+                datasets['validation'] = datasets['validation'].map(_generate_eval_prompts, load_from_cache_file=False)
+                datasets['test'] = datasets['test'].map(_generate_eval_prompts, load_from_cache_file=False)
+            else:
+                datasets['validation_matched'] = datasets['validation_matched'].map(_generate_eval_prompts, load_from_cache_file=False)
+                datasets['validation_mismatched'] = datasets['validation_mismatched'].map(_generate_eval_prompts, load_from_cache_file=False)
+                datasets['test_matched'] = datasets['test_matched'].map(_generate_eval_prompts, load_from_cache_file=False)
+                datasets['test_mismatched'] = datasets['test_mismatched'].map(_generate_eval_prompts, load_from_cache_file=False)
+
         else:
             datasets = datasets.map(_preprocess_function, batched=True, load_from_cache_file=False)
 
@@ -420,10 +428,10 @@ class glue_evaluator:
         global_step = -1  # -1 because we increment it before the first step
         update_step = 0  # 0 because it is logged before updating
 
-        if self.task_name == "stsb":
+        if self.task_name == 'stsb':
             raise NotImplementedError("best metric tracking is not implemented for STS-B. If it is MSE, you need to take min instead of max.")
 
-        best_results = {dataloader_type: None for dataloader_type in self.data_loaders.keys() if "validation" in dataloader_type}  # we maximize accuracy, in case of CoLA we maximize MCC
+        best_results = {dataloader_type: None for dataloader_type in self.data_loaders.keys() if 'validation' in dataloader_type}  # we maximize accuracy, in case of CoLA we maximize MCC
 
         for epoch in range(num_epochs):
             global_step += 1
@@ -556,10 +564,14 @@ class glue_evaluator:
                     results = self._evaluate(dataloader, dataloader_type)
                     wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()}, step=global_step)
 
-                    _metric_to_maximize = 'accuracy' if self.task_name != 'cola' else 'mcc'
-                    if results[_metric_to_maximize] > best_results[dataloader_type][_metric_to_maximize]:
+                    _metric_to_maximize = 'Accuracy' if self.task_name != 'cola' else 'MCC'
+
+                    if best_results[dataloader_type] is None:
                         best_results[dataloader_type] = results
-                        _log_dict = {f"best_{dataloader_type}/{k}": v for k, v in results.items}
+
+                    if results[_metric_to_maximize] >= best_results[dataloader_type][_metric_to_maximize]:
+                        best_results[dataloader_type] = results
+                        _log_dict = {f"best_{dataloader_type}/{k}": v for k, v in results.items()}
                         wandb.log(_log_dict, step=global_step)
 
                     for metric_name, result in results.items():
@@ -732,7 +744,6 @@ class glue_evaluator:
                     # aggregate predictions and labels
                     all_predictions.extend(prompt_preds)
                     all_labels.extend(true_labels)
-
 
                 else:
                     outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
