@@ -622,7 +622,7 @@ class glue_evaluator:
 
                     wandb.log({
                         "loss": loss,
-                        "train_accuracy": accuracy,
+                        "train_lm_accuracy": accuracy,
                         "epoch": epoch,
                         "update_step": update_step,
                         }, step=global_step)

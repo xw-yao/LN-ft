@@ -1,4 +1,4 @@
-name: torch5
+name: paralight
 channels:
   - defaults
 dependencies:
@@ -22,6 +22,8 @@ dependencies:
   - xz=5.2.5=h7b6447c_0
   - zlib=1.2.11=h7b6447c_3
   - pip:
+    - wandb
+    - accelerate
     - argon2-cffi==20.1.0
     - async-generator==1.10
     - attrs==20.3.0
