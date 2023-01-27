@@ -400,8 +400,8 @@ class glue_evaluator:
         # train and evaluate
         self.epochs = num_epochs
 
-        n = len(self.data_loaders['train'].dataset)
-        t_total = n // gradient_accumulation_steps * num_epochs
+        _n = len(self.data_loaders['train'].dataset)
+        t_total = _n // gradient_accumulation_steps * num_epochs
         warmup_steps = math.ceil(t_total * warmup_ratio)
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
@@ -417,9 +417,13 @@ class glue_evaluator:
         criteria = torch.nn.MSELoss() if self.is_regression else torch.nn.CrossEntropyLoss()
 
         train_dataloader = self.data_loaders['train']
-        n = len(train_dataloader.dataset)
         global_step = -1  # -1 because we increment it before the first step
         update_step = 0  # 0 because it is logged before updating
+
+        if self.task_name == "stsb":
+            raise NotImplementedError("best metric tracking is not implemented for STS-B. If it is MSE, you need to take min instead of max.")
+
+        best_results = {dataloader_type: None for dataloader_type in self.data_loaders.keys() if "validation" in dataloader_type}  # we maximize accuracy, in case of CoLA we maximize MCC
 
         for epoch in range(num_epochs):
             global_step += 1
@@ -456,11 +460,11 @@ class glue_evaluator:
                     loss = outputs.loss / gradient_accumulation_steps  # divide by gradient_accumulation_steps to scale loss
 
                     _predictions = torch.argmax(outputs.logits, dim=-1)
-                    targets = targets[:, 1:]
                     _predictions = _predictions[:, :-1]  # double check that _predictions do not end on a token that is a part of the label
-                    accuracy = (_predictions == targets) & (targets != -100)
+                    _targets = targets[:, 1:]
+                    accuracy = (_predictions == _targets) & (_targets != -100)
                     accuracy = accuracy.sum()
-                    accuracy = accuracy / torch.sum(targets != -100)
+                    accuracy = accuracy / torch.sum(_targets != -100)
 
                     wandb.log({
                         "loss": loss * gradient_accumulation_steps,  # report in-batch loss
@@ -543,16 +547,26 @@ class glue_evaluator:
                 # printing training progress
                 _loss_to_log = round(loss_sum / (step + 1), 3)
                 _accuracy_to_log = round(accuracy.item(), 3) if not self.is_regression else None
-                progress_bar.set_postfix({"loss": _loss_to_log, "accuracy": _accuracy_to_log})
+                progress_bar.set_postfix({'loss': _loss_to_log, 'accuracy': _accuracy_to_log})
             print()
 
             # evaluation
             for dataloader_type, dataloader in self.data_loaders.items():
                 if 'validation' in dataloader_type:
                     results = self._evaluate(dataloader, dataloader_type)
+                    wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()}, step=global_step)
+
+                    _metric_to_maximize = 'accuracy' if self.task_name != 'cola' else 'mcc'
+                    if results[_metric_to_maximize] > best_results[dataloader_type][_metric_to_maximize]:
+                        best_results[dataloader_type] = results
+                        _log_dict = {f"best_{dataloader_type}/{k}": v for k, v in results.items}
+                        wandb.log(_log_dict, step=global_step)
+
                     for metric_name, result in results.items():
                         self.evaluations[dataloader_type][metric_name].append(result)
+
             print()
+        # end of training loop
 
     def save(self, output_path):
         """Saves the evaluator to the output_path directory.
@@ -755,8 +769,6 @@ class glue_evaluator:
                 result = metric(all_labels, all_predictions)
             result = result[0] if self.is_regression else result
             results[metric_name] = result
-
-        wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()})
 
         return results
 
