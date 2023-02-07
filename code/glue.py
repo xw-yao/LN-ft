@@ -878,14 +878,19 @@ class glue_evaluator:
                             results = self._evaluate(dataloader, dataloader_type)
                             wandb.log({f"{dataloader_type}/{k}": v for k, v in results.items()}, step=global_step)
 
-                            _metric_to_maximize = 'Accuracy' if self.task_name != 'cola' else 'MCC'
+                            if self.task_name == 'cola':
+                                _metric_to_maximize = 'MCC'
+                            elif self.task_name == 'stsb':
+                                _metric_to_maximize = 'Pearson'
+                            else:
+                                _metric_to_maximize = 'Accuracy'
 
                             if best_results[dataloader_type] is None:
                                 best_results[dataloader_type] = results
 
                             if results[_metric_to_maximize] >= best_results[dataloader_type][_metric_to_maximize]:
                                 best_results[dataloader_type] = results
-                                _log_dict = {f"best_{dataloader_type}/{k}": v for k, v in results.items()}
+                                _log_dict = {f"best_{dataloader_type}/{k}": v for k, v in best_results[dataloader_type].items()}
                                 wandb.log(_log_dict, step=global_step)
 
                             for metric_name, result in results.items():
