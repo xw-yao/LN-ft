@@ -438,7 +438,8 @@ class glue_evaluator:
         self.epochs = num_epochs
 
         _n = len(self.data_loaders['train'].dataset)
-        t_total = _n // gradient_accumulation_steps * num_epochs
+        t_total = math.ceil(_n / self.batch_size) * num_epochs
+        #print(f'total update steps: {t_total}')
         warmup_steps = math.ceil(t_total * warmup_ratio)
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
@@ -465,7 +466,7 @@ class glue_evaluator:
                         'validation' in dataloader_type}  # we maximize accuracy, in case of CoLA we maximize MCC
 
         for epoch in range(num_epochs):
-            global_step += 1
+            #global_step += 1
             # move to train mode
             self.model.train()
 

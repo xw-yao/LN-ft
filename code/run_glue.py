@@ -60,6 +60,8 @@ def _parse_args():
                         help='if given, will save the evaluator for later inference/examination.')
     parser.add_argument('--verbose', action='store_true', default=True,
                         help='if given, will plot a list of trainable weights.')
+    parser.add_argument('--group', type=str, default=None,
+                        help='logging group name')
     return parser.parse_args()
 
 
@@ -171,7 +173,8 @@ def main():
     _plot_training_details(args)
 
     wandb.init(
-        project="ft-opt",
+        project="tune_lr",
+        group=args.group,
         config=vars(args),
     )
 
