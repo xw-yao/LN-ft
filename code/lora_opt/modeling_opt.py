@@ -1,3 +1,5 @@
+import sys
+sys.path.append('./configuration_opt.py')
 # coding=utf-8
 # Copyright 2022 The Fairseq Authors and The HuggingFace Inc. team. All rights reserved.
 #

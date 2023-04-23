@@ -118,7 +118,8 @@ TASK_TO_PROMPT_TRAIN = {
     "cola": """The following sentence is either "acceptable", meaning it is grammatically correct and makes sense, or "unacceptable". Which is it?\n{sentence1}\n{label}\n""",
     "sst2": """{sentence1}\nWas that sentence "positive" or "negative"? It was\n{label}\n""",
     "mrpc": """Does the sentence\n{sentence1}\nparaphrase (that is, mean the same thing as) this sentence? (yes or no)\n{sentence2}\n{label}\n""",
-    "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n{label}\n""",
+    # "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n{label}\n""",
+    "qqp": """Does the question\n{sentence1}\nparaphrase (that is, asking the same thing as) this question? (yes or no)\n{sentence2}\n{label}\n""",
     "stsb": """Rate on a scale from 0.0 to 5.0 how similar the sentences "{sentence1}" and "{sentence2}" are.\n{label}\n""",
     # note that you might need to round the labels to 1 digit after the comma
     "mnli": """{sentence1}\nBased on the previous passage, is it true that "{sentence2}"? Yes, no, or maybe?\n{label}\n""",
@@ -131,7 +132,8 @@ TASK_TO_PROMPT_EVAL = {
     "cola": """The following sentence is either "acceptable", meaning it is grammatically correct and makes sense, or "unacceptable". Which is it?\n{sentence1}\n""",
     "sst2": """{sentence1}\nWas that sentence "positive" or "negative"? It was\n""",
     "mrpc": """Does the sentence\n{sentence1}\nparaphrase (that is, mean the same thing as) this sentence? (yes or no)\n{sentence2}\n""",
-    "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n""",
+    "qqp": """Does the question\n{sentence1}\nparaphrase (that is, asking the same thing as) this question? (yes or no)\n{sentence2}\n""",
+    # "qqp": """Are the questions "{sentence1}" and "{sentence2}" asking the same thing? (yes or no)\n""",
     "stsb": """Rate on a scale from 0.0 to 5.0 how similar the sentences "{sentence1}" and "{sentence2}" are.\n""",
     # note that you might need to round the labels to 1 digit after the comma
     "mnli": """{sentence1}\nBased on the previous passage, is it true that "{sentence2}"? Yes, no, or maybe?\n""",

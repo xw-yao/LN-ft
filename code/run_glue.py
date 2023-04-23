@@ -61,7 +61,9 @@ def _parse_args():
     parser.add_argument('--verbose', action='store_true', default=True,
                         help='if given, will plot a list of trainable weights.')
     parser.add_argument('--group', type=str, default=None,
-                        help='logging group name')
+                        help='wandb logging group name')
+    parser.add_argument('--project', type=str, default=None,
+                        help='wandb logging project name')
     return parser.parse_args()
 
 
@@ -173,7 +175,7 @@ def main():
     _plot_training_details(args)
 
     wandb.init(
-        project="tune_lr",
+        project=args.project,
         group=args.group,
         config=vars(args),
     )

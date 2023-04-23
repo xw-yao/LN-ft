@@ -93,7 +93,7 @@ for lr in 5e-2 3e-2 1e-2 9e-3 7e-3 5e-3 3e-3 1e-3 9e-4 7e-4 5e-4; do
 #                    --model-name $MODEL_NAME \
 #                    --fine-tune-type lora_ln \
 #                    --apply-lora \
-#                    --param-terms lora lora self_attn_layer_norm\
+#                    --param-terms lora self_attn_layer_norm\
 #                    --group $group
 		    
 done            
